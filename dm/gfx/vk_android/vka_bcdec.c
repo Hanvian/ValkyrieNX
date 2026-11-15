@@ -81,7 +81,8 @@ static void *bcdec_pw_main(void *arg) {
 }
 
 void vka_bcdec_prewarm(void) {
-    if (V.bc || !V.push_desc || !V.dev) return;
+    vka_fmt f = {0};
+    if (!V.push_desc || !V.dev || !vka_fmt_of(0x53, &f) || !f.bc_dec) return;
     pthread_t th;
     if (!pthread_create(&th, NULL, bcdec_pw_main, NULL)) pthread_detach(th);
 }
