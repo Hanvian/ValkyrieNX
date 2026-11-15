@@ -84,10 +84,11 @@ jobs:
           ./gradlew --no-daemon apk \
             -PnxPackStage=/tmp/botw-stage/stage \
             -PnxApp=peanuts \
+            -PnxPackageId=dev.nxnative.botwexynos.peanuts \
             -PnxGames=01007EF00011E000 \
             -PnxLabel="The Legends Of Zelda: BoTW" \
             -PnxVersion=0.1.1-exynos \
-            -PnxVersionCode=1
+            -PnxVersionCode=2
           ls -lh out/
 
       - name: Upload BotW Exynos APK

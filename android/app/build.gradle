@@ -30,6 +30,10 @@ if (nxLive && (nxPlay || nxApp)) throw new GradleException('nxLive builds the re
 // (NX_SIGN_STORE, NX_SIGN_ALIAS, NX_SIGN_PASS, as nxLive), so an update installs over it and adb cannot run-as into the user's keys; give -PnxVersion=X.Y.Z for the update check
 def nxRelease = providers.gradleProperty('nxRelease').getOrElse('false') == 'true'
 if (nxRelease && nxApp != 'peanuts') throw new GradleException('nxRelease builds the Peanuts Native release: give -PnxApp=peanuts')
+// Optional custom applicationId (e.g., dev.nxnative.botwexynos.peanuts) so custom-signed test builds can install beside existing Peanuts Native releases.
+def nxPackageId = providers.gradleProperty('nxPackageId').getOrElse('')
+if (nxPackageId && !(nxPackageId ==~ /[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+/)) throw new GradleException("nxPackageId must be a valid Android package ID, not $nxPackageId")
+if (nxPackageId && (nxLive || nxRelease)) throw new GradleException('nxPackageId cannot override release applicationId')
 def nxVersion = providers.gradleProperty('nxVersion').getOrElse('0.1-bringup')
 def nxVersionCode = providers.gradleProperty('nxVersionCode').getOrElse('1') as int
 def signStore = System.getenv('NX_SIGN_STORE'), signAlias = System.getenv('NX_SIGN_ALIAS'), signPass = System.getenv('NX_SIGN_PASS')
@@ -237,7 +241,7 @@ android {
     ndkVersion '28.2.13676358'
 
     defaultConfig {
-        applicationId nxLive ? 'dev.bananative.android' : nxPlay ? 'dev.nxnative.android.play' : nxApp ? "dev.nxnative.android.$nxApp" : 'dev.nxnative.android'
+        applicationId nxPackageId ?: (nxLive ? 'dev.bananative.android' : nxPlay ? 'dev.nxnative.android.play' : nxApp ? "dev.nxnative.android.$nxApp" : 'dev.nxnative.android')
         resValue 'string', 'app_name', nxPlay || nxLive ? 'Banana Native' : nxApp ? nxLabel : 'Banana Native test'
         minSdk 33
         targetSdk 35
@@ -299,6 +303,7 @@ android {
         debug { manifest.srcFile 'src/ondevice/AndroidManifest.xml' }
     }
     signingConfigs {
+        debug { enableV1Signing true; enableV2Signing true; enableV3Signing true }
         if (nxLive || nxRelease) live { storeFile file(signStore); storePassword signPass; keyAlias signAlias; keyPassword signPass }   // PEANUTS: nxRelease too
     }
     buildTypes {
