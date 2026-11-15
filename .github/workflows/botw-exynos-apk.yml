@@ -57,7 +57,14 @@ jobs:
         run: |
           for f in dm/tools/tests/test_android*.py; do
             echo "::group::$f"
-            python -m unittest -v "$f"
+            if [ "$f" = "dm/tools/tests/test_android_saves.py" ]; then
+              # test_journal_matches_the_host compiles macOS host C headers; upstream runs it on macOS.
+              PYTHONPATH=dm/tools/tests python -m unittest -v \
+                test_android_saves.LauncherJvm.test_lock_held_by_another_process \
+                test_android_saves.LauncherJvm.test_saves_and_profiles
+            else
+              python -m unittest -v "$f"
+            fi
             echo "::endgroup::"
           done
           sh peanuts/scripts/check-runtime-profile.sh
