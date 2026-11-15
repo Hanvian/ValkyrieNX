@@ -195,11 +195,11 @@ void decode_bc7(uvec4 blk, uint dst_base) {
     uint isel = hisel != 0u ? getbits(blk, bit, 1u) : 0u;
     bit += hisel;
 
-    uint ep[6][4];
+    uint ep[24];
     for (uint c = 0u; c < 3u; c++) {
         for (uint s = 0u; s < nsub; s++) {
             for (uint e = 0u; e < 2u; e++) {
-                ep[s * 2u + e][c] = getbits(blk, bit, ncb);
+                ep[(s * 2u + e) * 4u + c] = getbits(blk, bit, ncb);
                 bit += ncb;
             }
         }
@@ -208,28 +208,30 @@ void decode_bc7(uvec4 blk, uint dst_base) {
     if (nab > 0u) {
         for (uint s = 0u; s < nsub; s++) {
             for (uint e = 0u; e < 2u; e++) {
-                ep[s * 2u + e][3] = getbits(blk, bit, nab);
+                ep[(s * 2u + e) * 4u + 3u] = getbits(blk, bit, nab);
                 bit += nab;
             }
         }
         ncomp = 4u;
     } else {
         for (uint s = 0u; s < nsub; s++) {
-            for (uint e = 0u; e < 2u; e++) ep[s * 2u + e][3] = 255u;
+            for (uint e = 0u; e < 2u; e++) ep[(s * 2u + e) * 4u + 3u] = 255u;
         }
     }
     if (hepp != 0u) {
         for (uint s = 0u; s < nsub; s++) {
             for (uint e = 0u; e < 2u; e++) {
                 uint pb = getbits(blk, bit, 1u); bit += 1u;
-                for (uint c = 0u; c < ncomp; c++) ep[s * 2u + e][c] = (ep[s * 2u + e][c] << 1u) | pb;
+                uint idx = (s * 2u + e) * 4u;
+                for (uint c = 0u; c < ncomp; c++) ep[idx + c] = (ep[idx + c] << 1u) | pb;
             }
         }
     } else if (hshp != 0u) {
         for (uint s = 0u; s < nsub; s++) {
             uint pb = getbits(blk, bit, 1u); bit += 1u;
             for (uint e = 0u; e < 2u; e++) {
-                for (uint c = 0u; c < ncomp; c++) ep[s * 2u + e][c] = (ep[s * 2u + e][c] << 1u) | pb;
+                uint idx = (s * 2u + e) * 4u;
+                for (uint c = 0u; c < ncomp; c++) ep[idx + c] = (ep[idx + c] << 1u) | pb;
             }
         }
     }
@@ -237,8 +239,9 @@ void decode_bc7(uvec4 blk, uint dst_base) {
     uint ab = nab + hepp + hshp;
     for (uint s = 0u; s < nsub; s++) {
         for (uint e = 0u; e < 2u; e++) {
-            for (uint c = 0u; c < 3u; c++) ep[s * 2u + e][c] = bc7_expand(ep[s * 2u + e][c], cb);
-            if (nab > 0u) ep[s * 2u + e][3] = bc7_expand(ep[s * 2u + e][3], ab);
+            uint idx = (s * 2u + e) * 4u;
+            for (uint c = 0u; c < 3u; c++) ep[idx + c] = bc7_expand(ep[idx + c], cb);
+            if (nab > 0u) ep[idx + 3u] = bc7_expand(ep[idx + 3u], ab);
         }
     }
 
@@ -265,13 +268,14 @@ void decode_bc7(uvec4 blk, uint dst_base) {
 
             uint ci = isel != 0u ? i1 : i0;
             uint cb_i = isel != 0u ? ni2 : ni1;
+            uint e0_idx = (sub * 2u) * 4u, e1_idx = (sub * 2u + 1u) * 4u;
             uint px[4];
             for (uint c = 0u; c < 3u; c++)
-                px[c] = uint(bptc_interp(int(ep[sub * 2u][c]), int(ep[sub * 2u + 1u][c]), ci, cb_i)) & 0xffu;
+                px[c] = uint(bptc_interp(int(ep[e0_idx + c]), int(ep[e1_idx + c]), ci, cb_i)) & 0xffu;
 
             uint ai = (ni2 != 0u && isel == 0u) ? i1 : i0;
             uint ab_i = (ni2 != 0u && isel == 0u) ? ni2 : ni1;
-            px[3] = uint(bptc_interp(int(ep[sub * 2u][3]), int(ep[sub * 2u + 1u][3]), ai, ab_i)) & 0xffu;
+            px[3] = uint(bptc_interp(int(ep[e0_idx + 3u]), int(ep[e1_idx + 3u]), ai, ab_i)) & 0xffu;
 
             if (rot != 0u) {
                 uint t = px[rot - 1u];
@@ -296,65 +300,45 @@ int bc6_unq(int v, uint bits, bool is_signed) {
     return ((v << 15) + 0x4000) >> int(bits - 1u);
 }
 
-void bc6_bf(uvec4 blk, inout uint bit, inout int ep[4][3], uint desc) {
-    uint e = desc & 3u;
-    uint c = (desc >> 2u) & 3u;
-    uint off = (desc >> 4u) & 15u;
-    uint nbits = (desc >> 8u) & 15u;
-    uint rev = (desc >> 12u) & 1u;
-    uint v = getbits(blk, bit, nbits);
-    bit += nbits;
-    if (rev != 0u) {
-        for (uint i = 0u; i < nbits; i++) {
-            if ((v & (1u << i)) != 0u) ep[e][c] |= (1 << int((nbits - 1u - i) + off));
-        }
-    } else {
-        ep[e][c] |= int(v) << int(off);
-    }
-}
-
 #define BF(e, c, off, n, r) ((uint(e)) | (uint(c) << 2u) | (uint(off) << 4u) | (uint(n) << 8u) | (uint(r) << 12u))
+
+// Packed BC6H mode descriptor tables matching k_bc6_modes in vka_bcn.h:
+const uint k_bfs[236] = uint[236](
+    // m0 (idx 0, len 19): tr=1 part=5 ep=10 idx=3 db={5,5,5}
+    BF(2,1,4,1,0),BF(2,2,4,1,0),BF(3,2,4,1,0),BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+    // m1 (idx 19, len 23): tr=1 part=5 ep=7 idx=3 db={6,6,6}
+    BF(2,1,5,1,0),BF(3,1,4,1,0),BF(3,1,5,1,0),BF(0,0,0,7,0),BF(3,2,0,1,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,7,0),BF(2,2,5,1,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,7,0),BF(3,2,3,1,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0),
+    // m2 (idx 42, len 18): tr=1 part=5 ep=11 idx=3 db={5,4,4}
+    BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,5,0),BF(0,0,10,1,0),BF(2,1,0,4,0),BF(1,1,0,4,0),BF(0,1,10,1,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,4,0),BF(0,2,10,1,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+    // m3 (idx 60, len 6): tr=0 part=0 ep=10 idx=4 db={10,10,10}
+    BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,10,0),BF(1,1,0,10,0),BF(1,2,0,10,0),
+    // m4 (idx 66, len 20): tr=1 part=5 ep=11 idx=3 db={4,5,4}
+    BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,1,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(0,1,10,1,0),BF(3,1,0,4,0),BF(1,2,0,4,0),BF(0,2,10,1,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,4,0),BF(3,2,0,1,0),BF(3,2,2,1,0),BF(3,0,0,4,0),BF(2,1,4,1,0),BF(3,2,3,1,0),
+    // m5 (idx 86, len 9): tr=1 part=0 ep=11 idx=4 db={9,9,9}
+    BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,9,0),BF(0,0,10,1,0),BF(1,1,0,9,0),BF(0,1,10,1,0),BF(1,2,0,9,0),BF(0,2,10,1,0),
+    // m6 (idx 95, len 20): tr=1 part=5 ep=11 idx=3 db={4,4,5}
+    BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,1,0),BF(2,2,4,1,0),BF(2,1,0,4,0),BF(1,1,0,4,0),BF(0,1,10,1,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(0,2,10,1,0),BF(2,2,0,4,0),BF(2,0,0,4,0),BF(3,2,1,1,0),BF(3,2,2,1,0),BF(3,0,0,4,0),BF(3,2,4,1,0),BF(3,2,3,1,0),
+    // m7 (idx 115, len 9): tr=1 part=0 ep=12 idx=4 db={8,8,8}
+    BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,8,0),BF(0,0,10,2,1),BF(1,1,0,8,0),BF(0,1,10,2,1),BF(1,2,0,8,0),BF(0,2,10,2,1),
+    // m8 (idx 124, len 19): tr=1 part=5 ep=9 idx=3 db={5,5,5}
+    BF(0,0,0,9,0),BF(2,2,4,1,0),BF(0,1,0,9,0),BF(2,1,4,1,0),BF(0,2,0,9,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+    // m9 (idx 143, len 9): tr=1 part=0 ep=16 idx=4 db={4,4,4}
+    BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,6,1),BF(1,1,0,4,0),BF(0,1,10,6,1),BF(1,2,0,4,0),BF(0,2,10,6,1),
+    // m10 (idx 152, len 19): tr=1 part=5 ep=8 idx=3 db={6,5,5}
+    BF(0,0,0,8,0),BF(3,1,4,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,2,3,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0),
+    // m12 (idx 171, len 21): tr=1 part=5 ep=8 idx=3 db={5,6,5}
+    BF(0,0,0,8,0),BF(3,2,0,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(2,1,5,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,1,5,1,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+    // m14 (idx 192, len 21): tr=1 part=5 ep=8 idx=3 db={5,5,6}
+    BF(0,0,0,8,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(2,2,5,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+    // m16 (idx 213, len 23): tr=0 part=5 ep=6 idx=3 db={6,6,6}
+    BF(0,0,0,6,0),BF(3,1,4,1,0),BF(3,2,0,1,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,6,0),BF(2,1,5,1,0),BF(2,2,5,1,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,6,0),BF(3,1,5,1,0),BF(3,2,3,1,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0)
+);
 
 void decode_bc6h(uvec4 blk, uint dst_base, bool is_signed) {
     uint b0 = blk.x & 0xffu;
     uint mnum, bit;
     if ((b0 & 2u) != 0u) { mnum = (((b0 >> 1u) & 0xeu) | (b0 & 1u)) + 2u; bit = 5u; }
     else { mnum = b0 & 3u; bit = 2u; }
-
-    // Packed BC6H mode descriptor tables matching k_bc6_modes in vka_bcn.h:
-    const uint k_bfs[220] = uint[220](
-        // m0 (idx 0, len 19): tr=1 part=5 ep=10 idx=3 db={5,5,5}
-        BF(2,1,4,1,0),BF(2,2,4,1,0),BF(3,2,4,1,0),BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
-        // m1 (idx 19, len 23): tr=1 part=5 ep=7 idx=3 db={6,6,6}
-        BF(2,1,5,1,0),BF(3,1,4,1,0),BF(3,1,5,1,0),BF(0,0,0,7,0),BF(3,2,0,1,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,7,0),BF(2,2,5,1,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,7,0),BF(3,2,3,1,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0),
-        // m2 (idx 42, len 18): tr=1 part=5 ep=11 idx=3 db={5,4,4}
-        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,5,0),BF(0,0,10,1,0),BF(2,1,0,4,0),BF(1,1,0,4,0),BF(0,1,10,1,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,4,0),BF(0,2,10,1,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
-        // m3 (idx 60, len 6): tr=0 part=0 ep=10 idx=4 db={10,10,10}
-        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,10,0),BF(1,1,0,10,0),BF(1,2,0,10,0),
-        // m4 (idx 66, len 20): tr=1 part=5 ep=11 idx=3 db={4,5,4}
-        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,1,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(0,1,10,1,0),BF(3,1,0,4,0),BF(1,2,0,4,0),BF(0,2,10,1,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,4,0),BF(3,2,0,1,0),BF(3,2,2,1,0),BF(3,0,0,4,0),BF(2,1,4,1,0),BF(3,2,3,1,0),
-        // m5 (idx 86, len 9): tr=1 part=0 ep=11 idx=4 db={9,9,9}
-        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,9,0),BF(0,0,10,1,0),BF(1,1,0,9,0),BF(0,1,10,1,0),BF(1,2,0,9,0),BF(0,2,10,1,0),
-        // m6 (idx 95, len 20): tr=1 part=5 ep=11 idx=3 db={4,4,5}
-        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,1,0),BF(2,2,4,1,0),BF(2,1,0,4,0),BF(1,1,0,4,0),BF(0,1,10,1,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(0,2,10,1,0),BF(2,2,0,4,0),BF(2,0,0,4,0),BF(3,2,1,1,0),BF(3,2,2,1,0),BF(3,0,0,4,0),BF(3,2,4,1,0),BF(3,2,3,1,0),
-        // m7 (idx 115, len 9): tr=1 part=0 ep=12 idx=4 db={8,8,8}
-        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,8,0),BF(0,0,10,2,1),BF(1,1,0,8,0),BF(0,1,10,2,1),BF(1,2,0,8,0),BF(0,2,10,2,1),
-        // m8 (idx 124, len 19): tr=1 part=5 ep=9 idx=3 db={5,5,5}
-        BF(0,0,0,9,0),BF(2,2,4,1,0),BF(0,1,0,9,0),BF(2,1,4,1,0),BF(0,2,0,9,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
-        // m9 (idx 143, len 9): tr=1 part=0 ep=16 idx=4 db={4,4,4}
-        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,6,1),BF(1,1,0,4,0),BF(0,1,10,6,1),BF(1,2,0,4,0),BF(0,2,10,6,1),
-        // m10 (idx 152, len 19): tr=1 part=5 ep=8 idx=3 db={6,5,5}
-        BF(0,0,0,8,0),BF(3,1,4,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,2,3,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0),
-        // m12 (idx 171, len 21): tr=1 part=5 ep=8 idx=3 db={5,6,5}
-        BF(0,0,0,8,0),BF(3,2,0,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(2,1,5,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,1,5,1,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
-        // m14 (idx 192, len 21): tr=1 part=5 ep=8 idx=3 db={5,5,6}
-        BF(0,0,0,8,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(2,2,5,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
-        // m16 (idx 213, dummy placeholder unused by loop length) - actually m16 has 23 fields; let's check index below
-        0u,0u,0u,0u,0u,0u,0u
-    );
-    const uint k_bfs16[23] = uint[23](
-        BF(0,0,0,6,0),BF(3,1,4,1,0),BF(3,2,0,1,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,6,0),BF(2,1,5,1,0),BF(2,2,5,1,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,6,0),BF(3,1,5,1,0),BF(3,2,3,1,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0)
-    );
 
     uint bf_off = 0u, bf_len = 0u, tr = 0u, pb = 0u, epb = 0u, ib = 0u, db0 = 0u, db1 = 0u, db2 = 0u;
     bool res = false;
@@ -371,7 +355,7 @@ void decode_bc6h(uvec4 blk, uint dst_base, bool is_signed) {
     else if (mnum == 10u) { bf_off = 152u; bf_len = 19u; tr = 1u; pb = 5u; epb = 8u;  ib = 3u; db0 = 6u; db1 = 5u; db2 = 5u; }
     else if (mnum == 12u) { bf_off = 171u; bf_len = 21u; tr = 1u; pb = 5u; epb = 8u;  ib = 3u; db0 = 5u; db1 = 6u; db2 = 5u; }
     else if (mnum == 14u) { bf_off = 192u; bf_len = 21u; tr = 1u; pb = 5u; epb = 8u;  ib = 3u; db0 = 5u; db1 = 5u; db2 = 6u; }
-    else if (mnum == 16u) { bf_len = 23u; tr = 0u; pb = 5u; epb = 6u;  ib = 3u; db0 = 6u; db1 = 6u; db2 = 6u; }
+    else if (mnum == 16u) { bf_off = 213u; bf_len = 23u; tr = 0u; pb = 5u; epb = 6u;  ib = 3u; db0 = 6u; db1 = 6u; db2 = 6u; }
     else res = true;
 
     if (res) {
@@ -385,12 +369,17 @@ void decode_bc6h(uvec4 blk, uint dst_base, bool is_signed) {
         return;
     }
 
-    int ep[4][3];
-    for (uint e = 0u; e < 4u; e++) { ep[e][0] = 0; ep[e][1] = 0; ep[e][2] = 0; }
-    if (mnum == 16u) {
-        for (uint i = 0u; i < 23u; i++) bc6_bf(blk, bit, ep, k_bfs16[i]);
-    } else {
-        for (uint i = 0u; i < bf_len; i++) bc6_bf(blk, bit, ep, k_bfs[bf_off + i]);
+    int ep[12];
+    for (uint i = 0u; i < 12u; i++) ep[i] = 0;
+    for (uint i = 0u; i < bf_len; i++) {
+        uint desc = k_bfs[bf_off + i];
+        uint idx = (desc & 3u) * 3u + ((desc >> 2u) & 3u);
+        uint off = (desc >> 4u) & 15u;
+        uint nbits = (desc >> 8u) & 15u;
+        uint v = getbits(blk, bit, nbits);
+        bit += nbits;
+        if ((desc & 0x1000u) != 0u) v = bitfieldReverse(v) >> (32u - nbits);
+        ep[idx] |= int(v << off);
     }
 
     uint n_ep = pb != 0u ? 4u : 2u;
@@ -399,15 +388,15 @@ void decode_bc6h(uvec4 blk, uint dst_base, bool is_signed) {
         int mask = (1 << int(epb)) - 1;
         for (uint e = 1u; e < n_ep; e++) {
             for (uint c = 0u; c < 3u; c++) {
-                int d = sext(ep[e][c], db[c]);
-                ep[e][c] = (ep[0][c] + d) & mask;
+                int d = sext(ep[e * 3u + c], db[c]);
+                ep[e * 3u + c] = (ep[c] + d) & mask;
             }
         }
     }
     for (uint e = 0u; e < n_ep; e++) {
         for (uint c = 0u; c < 3u; c++) {
-            int v = is_signed ? sext(ep[e][c], epb) : ep[e][c];
-            ep[e][c] = bc6_unq(v, epb, is_signed);
+            int v = is_signed ? sext(ep[e * 3u + c], epb) : ep[e * 3u + c];
+            ep[e * 3u + c] = bc6_unq(v, epb, is_signed);
         }
     }
 
@@ -428,9 +417,10 @@ void decode_bc6h(uvec4 blk, uint dst_base, bool is_signed) {
             uint is_anc = (texel == 0u || (nsub == 2u && k_anc0[part] == texel)) ? 1u : 0u;
             uint sub = (subsets >> (texel * 2u)) & 3u;
             uint idx = getbits(blk, bit + ib * texel - anc, ib - is_anc);
+            uint e0_idx = (sub * 2u) * 3u, e1_idx = (sub * 2u + 1u) * 3u;
             uint h[3];
             for (uint c = 0u; c < 3u; c++) {
-                int v = bptc_interp(ep[sub * 2u][c], ep[sub * 2u + 1u][c], idx, ib);
+                int v = bptc_interp(ep[e0_idx + c], ep[e1_idx + c], idx, ib);
                 if (is_signed) h[c] = uint(v < 0 ? (((-v * 31) / 32) | 0x8000) : ((v * 31) / 32)) & 0xffffu;
                 else h[c] = uint((v * 31) / 64) & 0xffffu;
             }

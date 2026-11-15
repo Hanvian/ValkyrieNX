@@ -53,7 +53,13 @@ static int ensure_pipe(void) {
             .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
             .layout = g_lay,
         };
-        r = vk.vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_pipe);
+        uint64_t t0 = now_ns();
+        r = vk.vkCreateComputePipelines(V.dev, vka_pso_cache(), 1, &ci, NULL, &g_pipe);
+        double ms = (now_ns() - t0) / 1e6;
+        if (!r && g_pipe) {
+            VLOG("GPU BC4-7 decoder pipeline ready in %.1f ms", ms);
+            if (ms > 50.0) vka_pso_save(2);
+        }
     }
     if (m) vk.vkDestroyShaderModule(V.dev, m, NULL);
     if (r) {
@@ -65,6 +71,19 @@ static int ensure_pipe(void) {
     }
     pthread_mutex_unlock(&g_mu);
     return g_pipe != VK_NULL_HANDLE;
+}
+
+static void *bcdec_pw_main(void *arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "vk-bcdec-pw");
+    ensure_pipe();
+    return NULL;
+}
+
+void vka_bcdec_prewarm(void) {
+    if (V.bc || !V.push_desc || !V.dev) return;
+    pthread_t th;
+    if (!pthread_create(&th, NULL, bcdec_pw_main, NULL)) pthread_detach(th);
 }
 
 int vka_bcdec_dispatch(VkCommandBuffer cb, VkBuffer src_buf, VkDeviceSize src_off, uint32_t src_row_bytes, uint32_t src_layer_bytes,

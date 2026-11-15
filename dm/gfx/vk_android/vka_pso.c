@@ -235,8 +235,10 @@ static void pc_open_once(void) {
     pthread_t th;
     if (!pthread_create(&th, NULL, saver_main, NULL)) { pthread_detach(th); g_sv_up = 1; }
     pw_start();
+    vka_bcdec_prewarm();
 }
 static void pc_open(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, pc_open_once); }   // (the prewarm threads it starts call it too: they wait for it)
+VkPipelineCache vka_pso_cache(void) { pc_open(); return g_pc; }
 // The cache and the prewarm list to their files. vkGetPipelineCacheData runs without g_mu (the cache is internally synchronized): holding it there kept the replay thread's
 // pipeline lookups waiting for a 17 MB copy once a minute
 static void save_now(void) {
@@ -1293,9 +1295,19 @@ void vka_pso_async_line(char *out, size_t n) {
              g_as_order ? "least cost first, the oldest in turn (DM_VK_PSO_ORDER)" : "in arrival order (DM_VK_PSO_ORDER=0)",
              (unsigned long long)cn, cl, (unsigned long long)on, ol);
 }
+static int must_sync_draw(vka_shader *const sh[VKA_NSTAGE]) {
+    if (vka_rp_must_draw()) return 1;
+    for (int s = 0; s < VKA_NSTAGE; s++) {
+        if (!sh[s]) continue;
+        if (sh[s]->gs_fx) return 1;
+        if (sh[s]->e && sh[s]->b) for (uint16_t i = 0; i < sh[s]->e->bind_count; i++)
+            if (sh[s]->b[i].flags & DMSH_VK_BF_RW) return 1;
+    }
+    return 0;
+}
 static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int *made) {
     *made = 0;
-    int async = !prewarm && !sh[7] && as_threads() > 0;
+    int async = !prewarm && !sh[7] && as_threads() > 0 && !must_sync_draw(sh) && (!gpl_on() || VKA_ENV("DM_VK_PSO_ASYNC_GPL_SKIP", 0));
     pthread_mutex_lock(&g_mu);
     gval *g = km_get(&g_gfx, fk, h);
     if (g) {

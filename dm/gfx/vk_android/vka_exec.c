@@ -621,6 +621,10 @@ static void chunk(void) {
     if (ts) g_slot_parts[k] = part + 1;
     if (VKA_ENV("DM_VK_PARTLOG", 0)) { char zb[400]; vka_rp_zstats(zb, sizeof zb);
         VLOG("part %u of the submission of frame %llu ended at %.3f s: %llu draws%s", part, (unsigned long long)g_frame, now_ns() / 1e9, (unsigned long long)(g_stat_draws - g_chunk_d0), zb); }
+    vka_disp_settle(g_cb);
+    vka_tex_writeback(g_cb);
+    { VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT};
+      vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL); }
     vka_gbar_settle(g_cb);   // a game barrier left pending (vka_gbar.c), in this part: it covers the parts after it
     vka_up_flush(); vka_up_throttle();   // the upload batch goes first: the part may use what it made (vka_dev.c "Upload batches")
     // With the encoder the part's end, its submit and the next part's reset and begin are made on its thread, in order with the calls before: the replay thread goes on
@@ -1593,6 +1597,10 @@ void vka_rp_gate(uint64_t g, VkEvent ev) {
     if (g > g_gate_next) g_gate_next = g;   // (two gates before a submission: the later one, as gates open in order)
     if (g_cb && ev) {   // (outside a pass: a wait with the host stage may not be in one)
         vka_rp_end();
+        vka_disp_settle(g_cb);
+        vka_tex_writeback(g_cb);
+        { VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT};
+          vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL); }
         gate_ev_arg ga = {g_cb, ev};
         if (!vka_enc_call(gate_ev_wait, &ga, sizeof ga)) gate_ev_wait(&ga);
     }

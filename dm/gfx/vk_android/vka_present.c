@@ -893,7 +893,7 @@ static void *present_main(void *arg) {
         for (int g = 0; g < ng; g++) { pq_item gi = it; gi.src = gen[g]; gi.has_crop = 0; gi.ticket = 0; gi.fence = 0; gi.hold = hold; vka_fps_note(present_one(&gi), 1); }
         it.hold = ng ? hold : game_period;
         int shown = present_one(&it);
-        if (shown) { dm_guest_frame_tick(); if (peanuts_tick) peanuts_tick(); }   // PEANUTS: the companion's per-frame tick (dm/peanuts)
+        if (shown) { extern _Atomic uint64_t dm_present_ns; __atomic_store_n(&dm_present_ns, now_ns(), __ATOMIC_RELAXED); dm_guest_frame_tick(); if (peanuts_tick) peanuts_tick(); }   // PEANUTS: the companion's per-frame tick (dm/peanuts)
         if (!shown || !V.display_timing) pres_note(it.ticket, shown ? now_ns() / 1e9 : -1);
         vka_fps_note(shown, 0);
         pthread_mutex_lock(&g_pmu);
@@ -961,6 +961,11 @@ int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)ti
 int mtl_link_wait_ticks(int ticks, uint64_t timeout_ns) { (void)ticks; (void)timeout_ns; return 0; }
 int mtl_snap_on(void) { return 0; }
 uint64_t mtl_snap_acquire_wait(void) { return 0; }
+void vka_present_hitch_log(void) {
+    VLOG("present queue: in=%llu fill=%llu read=%llu done=%llu surf=%p",
+         (unsigned long long)g_pq_in, (unsigned long long)g_pq_fill,
+         (unsigned long long)g_pq_read, (unsigned long long)g_pq_done, (void *)g_surf);
+}
 
 static void *selftest_main(void *arg) { vka_fp_host("vk-selftest"); int r = nxhost_vk_selftest(NULL, (int)(intptr_t)arg); VLOG("selftest (NXHOST_VK_SELFTEST) ended: %s", r ? "FAILED" : "passed"); return NULL; }
 #endif

@@ -432,4 +432,13 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     push(&j);
     return j.ticket;
 }
+void vka_present_hitch_log(void);
+void vka_hitch_dump(void) {
+    vka_pso_builds_log();
+    vka_present_hitch_log();
+    VLOG("replay worker: qin=%llu qout=%llu parked=%d tl_queued=%llu done=%llu fence_last=%llu",
+         (unsigned long long)g_qin, (unsigned long long)g_qout,
+         qs_parked(&g_qs), (unsigned long long)__atomic_load_n(&V.tl_queued, __ATOMIC_RELAXED),
+         (unsigned long long)vka_done(), (unsigned long long)vka_fence_last());
+}
 #endif

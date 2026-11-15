@@ -2912,6 +2912,19 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     if (vka_nan_on() >= 2 && vka_nan_split(R.cim, R.nci)) vka_rp_end();   // DM_VK_NANSCAN=2: a scan inside the game's pass
 }
 
+int vka_rp_must_draw(void) {
+    if (!R.on) return 0;
+    if (R.nbcrt > 0 || (R.full_w && R.full_w <= 256) || (R.full_h && R.full_h <= 256)) return 1;
+    for (int i = 0; i < R.nci; i++) {
+        vka_img *im = R.cim[i];
+        if (!im) continue;
+        if (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 1;
+        if (im->d.w <= 256 || im->d.h <= 256) return 1;
+        if (im->d.target == NVN_TEXTURE_TARGET_3D || im->d.target == NVN_TEXTURE_TARGET_CUBEMAP || im->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) return 1;
+    }
+    return 0;
+}
+
 int dm_sdk_ounce(void);
 static int g_nvn2 = -1;
 void vka_set_nvn2(int on) { g_nvn2 = on != 0; }

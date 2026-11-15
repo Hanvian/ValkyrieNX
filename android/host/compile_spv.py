@@ -48,6 +48,7 @@ def main():
 
     glslang = _find_tool(["glslangValidator"], args.ndk)
     glslc = _find_tool(["glslc"], args.ndk)
+    spirv_opt = _find_tool(["spirv-opt"], args.ndk)
     spirv_val = _find_tool(["spirv-val"], args.ndk)
     if not glslang and not glslc:
         sys.exit("compile_spv.py: neither glslangValidator nor glslc found (install glslang-tools or pass --ndk)")
@@ -55,10 +56,14 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out_h)), exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         spv = os.path.join(tmp, os.path.basename(args.src) + ".spv")
-        if glslang:
-            subprocess.run([glslang, "-V", "--target-env", "vulkan1.1", "-g0", "-o", spv, args.src], check=True, stdout=subprocess.DEVNULL)
-        else:
+        if glslc:
             subprocess.run([glslc, "--target-env=vulkan1.1", "-O", "-o", spv, args.src], check=True)
+        else:
+            subprocess.run([glslang, "-V", "--target-env", "vulkan1.1", "-g0", "-o", spv, args.src], check=True, stdout=subprocess.DEVNULL)
+            if spirv_opt:
+                spv_opt = spv + ".opt"
+                if subprocess.run([spirv_opt, "--target-env=vulkan1.1", "-O", spv, "-o", spv_opt], check=False).returncode == 0:
+                    os.replace(spv_opt, spv)
         if spirv_val:
             subprocess.run([spirv_val, "--target-env", "vulkan1.1", spv], check=True)
         data = open(spv, "rb").read()

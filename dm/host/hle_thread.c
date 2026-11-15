@@ -507,6 +507,9 @@ static void *hitch_main(void *arg) {
         if (!p || p == seen || now - p < lim || now - g_t0_ns < skip) continue;
         seen = p; n++;
         LOG("hitch dump %d: no present for %.1f ms", n, (now - p) / 1e6);
+#if defined(__ANDROID__)
+        void vka_hitch_dump(void); vka_hitch_dump();
+#endif
         int nt = 0;
         pthread_mutex_lock(&G); for (thr_t *t = g_all; t && nt < 256; t = t->all) if (t->started && !t->exited) hitch_grab(t, &hs[nt++]); pthread_mutex_unlock(&G);
         for (int k = 0; k < nt; k++) hitch_log(&hs[k]);
@@ -514,7 +517,11 @@ static void *hitch_main(void *arg) {
     return NULL;
 }
 static void hitch_init(void) {
-    const char *e = getenv("DM_HITCH_DUMP"); if (!e || atoi(e) <= 0) return;
+    const char *e = getenv("DM_HITCH_DUMP");
+#if defined(__ANDROID__)
+    if (!e) e = "5000:15";
+#endif
+    if (!e || atoi(e) <= 0) return;
     pthread_t th; pthread_create(&th, NULL, hitch_main, (void *)e); pthread_detach(th);
     LOG("DM_HITCH_DUMP=%s: the guest threads are logged when no frame is presented for that many ms", e);
 }
