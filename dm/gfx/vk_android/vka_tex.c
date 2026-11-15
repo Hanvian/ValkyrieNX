@@ -25,6 +25,7 @@
 #include "vka_spvpatch.h"
 #include "game_profile.h"
 #include "vka_texown.h"
+#include "vka_bcn.h"
 
 __attribute__((weak)) int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) { (void)mem; (void)size; (void)stride; return 0; }
 __attribute__((weak)) uint64_t dm_codec_video_gen(const void *mem) { (void)mem; return 0; }
@@ -119,20 +120,51 @@ int vka_fmt_of(int nf, vka_fmt *o) {
     }
     return fmt_of_slow(nf, o);
 }
+static int bc_fallback(int nf, VkFormat *vk_out, int *bpb_out) {
+    switch (nf) {
+    case 0x49: *vk_out = VK_FORMAT_R8_UNORM; *bpb_out = 1; return VKA_BC4_UNORM;
+    case 0x4A: *vk_out = VK_FORMAT_R8_SNORM; *bpb_out = 1; return VKA_BC4_SNORM;
+    case 0x4B: *vk_out = VK_FORMAT_R8G8_UNORM; *bpb_out = 2; return VKA_BC5_UNORM;
+    case 0x4C: *vk_out = VK_FORMAT_R8G8_SNORM; *bpb_out = 2; return VKA_BC5_SNORM;
+    case 0x4D: case 0x4E: *vk_out = VK_FORMAT_R8G8B8A8_UNORM; *bpb_out = 4; return VKA_BC7;
+    case 0x4F: *vk_out = VK_FORMAT_R16G16B16A16_SFLOAT; *bpb_out = 8; return VKA_BC6H_SFLOAT;
+    case 0x50: *vk_out = VK_FORMAT_R16G16B16A16_SFLOAT; *bpb_out = 8; return VKA_BC6H_UFLOAT;
+    default: return VKA_BC_NONE;
+    }
+}
 static int fmt_of_slow(int nf, vka_fmt *o) {
     fmt_ent e = fmt_ent_of(nf); int bw, bh, bpb = nvn_fmt_bpb(nf, &bw, &bh);
+    uint8_t bc_dec = 0, src_bpb = 0;
     if (e.vk == VK_FORMAT_D24_UNORM_S8_UINT && !(feats(e.vk) & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) e.vk = VK_FORMAT_D32_SFLOAT_S8_UINT;
     if (e.vk == VK_FORMAT_X8_D24_UNORM_PACK32 && !(feats(e.vk) & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) e.vk = VK_FORMAT_D32_SFLOAT;
-    if (e.vk == VK_FORMAT_UNDEFINED || !bpb || !(feats(e.vk) & (VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))) {
+    const VkFormatFeatureFlags need_ff = VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (e.vk != VK_FORMAT_UNDEFINED && bpb && (feats(e.vk) & need_ff) != need_ff && VKA_ENV("DM_VK_SW_BC", 1)) {
+        VkFormat fb_vk = VK_FORMAT_UNDEFINED; int fb_bpb = 0; int dec = bc_fallback(nf, &fb_vk, &fb_bpb);
+        if (dec && (feats(fb_vk) & need_ff) == need_ff) {
+            static uint64_t fblog[4]; unsigned b = (unsigned)nf & 255;
+            if (!(__atomic_fetch_or(&fblog[b >> 6], 1ull << (b & 63), __ATOMIC_RELAXED) >> (b & 63) & 1))
+                VLOG("NVN format %#x (VkFormat %d) unsupported on this GPU: software-decoding BC4-7 into VkFormat %d", nf, e.vk, fb_vk);
+            bc_dec = (uint8_t)dec; src_bpb = (uint8_t)bpb; e.vk = fb_vk; bpb = fb_bpb; bw = 1; bh = 1;
+        }
+    }
+    if (e.vk == VK_FORMAT_UNDEFINED || !bpb || !(feats(e.vk) & need_ff)) {
         static uint64_t logged[4]; unsigned b = (unsigned)nf & 255;
         if (!(__atomic_fetch_or(&logged[b >> 6], 1ull << (b & 63), __ATOMIC_RELAXED) >> (b & 63) & 1)) VRED("NVN format %#x has no Vulkan format on this device (VkFormat %d)", nf, e.vk);
         return 0;
     }
-    *o = (vka_fmt){e.vk, e.srgb ? srgb_twin(e.vk) : e.vk, e.kind, e.srgb, (uint8_t)bpb, (uint8_t)bw, (uint8_t)bh};
+    *o = (vka_fmt){e.vk, e.srgb ? srgb_twin(e.vk) : e.vk, e.kind, e.srgb, (uint8_t)bpb, (uint8_t)bw, (uint8_t)bh, bc_dec, src_bpb};
     return 1;
 }
 static VkImageAspectFlags aspect_of(int kind) { return kind == 3 ? VK_IMAGE_ASPECT_DEPTH_BIT : kind == 4 ? VK_IMAGE_ASPECT_STENCIL_BIT : kind == 5 ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT; }
 static int compressed(const vka_fmt *f) { return f->bw > 1 || f->bh > 1; }
+static void src_geom(const vka_fmt *f, uint32_t w, uint32_t h, uint32_t *bx, uint32_t *by, size_t *pitch, uint32_t *bw, uint32_t *bh) {
+    uint32_t mbw = f->bc_dec ? 4 : f->bw, mbh = f->bc_dec ? 4 : f->bh, mbpb = f->bc_dec ? f->src_bpb : f->bpb;
+    if (bw) *bw = mbw;
+    if (bh) *bh = mbh;
+    *bx = (w + mbw - 1) / mbw;
+    *by = (h + mbh - 1) / mbh;
+    *pitch = (size_t)*bx * mbpb;
+}
 
 uint64_t vka_n_bar;   // full barriers recorded (vka_exec.c replay statistics)
 // DM_VK_XP_TS=mask (experiment, live): a bottom-of-pipe timestamp (Turnip: a wait for idle) at chosen sites, to find which one the Turnip LRZ hang needs
@@ -279,8 +311,9 @@ static int vl_learn(VkFormat a, VkFormat b, uint32_t w, uint32_t h);
 static pthread_mutex_t g_vlmu;
 static int same_shape(const vka_img *a, const tex_t *t, const vka_fmt *f, int learn) {   // learn = 0: a diagnostic's question (vka_cap_shared), nothing learned or logged
     if (a->mem != t->mem || a->d.target != t->d.target || a->d.width != t->d.width || a->d.height != t->d.height || a->d.depth != t->d.depth || a->d.levels != t->d.levels || a->d.samples != t->d.samples) return 0;
+    if (a->f.bc_dec != f->bc_dec) return 0;
     if (a->f.vk == f->vk) return 1;
-    if (!(a->f.kind <= 2 && f->kind <= 2 && a->f.bpb == f->bpb && !compressed(&a->f) && !compressed(f))) return 0;
+    if (!(a->f.kind <= 2 && f->kind <= 2 && a->f.bpb == f->bpb && !compressed(&a->f) && !compressed(f) && !a->f.bc_dec && !f->bc_dec)) return 0;
     int lv = img_lists(a, f->vk), lw = img_lists(a, f->view);
     if (lv && lw) return 1;
     if (!learn) return 0;
@@ -444,7 +477,7 @@ static uint32_t sparse_base(const void *pool, const uint8_t *mem, const nvn_texd
 // image from base would take DM_VK_SPARSE_RES_MB (default 32) or more; or a GPU-written one (sparse_gpu) from level 0. Smaller ones stay dense (the tiles' bookkeeping and binds cost more than they save)
 static int res_candidate(const tex_t *t, const vka_fmt *f, uint32_t base) {
     const nvn_texdesc *d = &t->d; uint32_t tw, th, td;
-    if (!vks_on() || !(sparse_sampled(t, f) || (base == 0 && sparse_gpu(t, f))) || (d->target != NVN_TEXTURE_TARGET_2D && d->target != NVN_TEXTURE_TARGET_2D_ARRAY) || d->samples > 1) return 0;
+    if (f->bc_dec || !vks_on() || !(sparse_sampled(t, f) || (base == 0 && sparse_gpu(t, f))) || (d->target != NVN_TEXTURE_TARGET_2D && d->target != NVN_TEXTURE_TARGET_2D_ARRAY) || d->samples > 1) return 0;
     if (nvn_tex_sparse_tiles(d, &tw, &th, &td) <= (int)base || td != 1) return 0;
     uint64_t lo = nvn_tex_level_offset(d, base), ly = t->L.layer_size > lo ? t->L.layer_size - lo : 0;
     return (double)ly * (t->L.layers ? t->L.layers : 1) >= VKA_ENVF("DM_VK_SPARSE_RES_MB", 32.0) * 1048576.0;
@@ -504,7 +537,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     // rows are copied from the storage as a linear texture's are (tbuf_rows_copy: at first use, then the rows the CPU wrote), the last row ending at the storage's end
     int tbuf = d->target == NVN_TEXTURE_TARGET_BUFFER; uint32_t tbw = 0, tbh = 0, tbrow = 0;
     if (tbuf && !VKA_ENV("DM_VK_TBUF", 1)) { VRED_ONCE("texture buffers are off (DM_VK_TBUF=0; first: serial %llu)", (unsigned long long)t->serial); return NULL; }   // the comparison switch
-    if (tbuf && (f->kind >= 3 || compressed(f) || !nvn_tbuf_rows(d->width, f->bpb, 1, &tbw, &tbh, &tbrow) || tbw > V.props.limits.maxImageDimension2D || tbh > V.props.limits.maxImageDimension2D)) {
+    if (tbuf && (f->kind >= 3 || compressed(f) || f->bc_dec || !nvn_tbuf_rows(d->width, f->bpb, 1, &tbw, &tbh, &tbrow) || tbw > V.props.limits.maxImageDimension2D || tbh > V.props.limits.maxImageDimension2D)) {
         VRED_ONCE("buffer texture serial %llu: %u elements of format %#x have no 2D-row image (first case)", (unsigned long long)t->serial, d->width, d->format); return NULL; }
     vka_img *im = calloc(1, sizeof *im);
     im->serial = t->serial; im->mem = t->mem; im->d = *d; im->L = t->L; im->f = *f; im->refs = 1;
@@ -532,7 +565,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     VkFormatFeatureFlags ff = feats(f->vk);
     VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) u |= VK_IMAGE_USAGE_SAMPLED_BIT;
-    if ((ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !compressed(f)) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if ((ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !compressed(f) && !f->bc_dec) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (d->flags & NVN_TEXTURE_FLAGS_IMAGE)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     // Views in another format: only an 8-bit / BC / ASTC UNORM image as its sRGB twin (NVN sRGB formats are stored as UNORM, and UNORM textures have sRGB views; the
@@ -581,7 +614,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     if (is3d && (u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT))) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     // Zero-shared images (below): a large GPU-content image the caller makes (g_zwant: vka_tex_get, its content ST_ZERO) is made to alias the zeroed memory of its create info
     int zs = g_zwant && VKA_ENV("DM_VK_ZSHARE", 1) && vkz_candidate(t->L.size, (uint64_t)(VKA_ENVF("DM_VK_ZSHARE_MB", 4.0) * 1048576.0),
-                                                                    vkz_max(f->kind >= 3, V.driver_id == VK_DRIVER_ID_MESA_TURNIP, (int64_t)VKA_ENVF("DM_VK_ZSHARE_MAX_MB", -1.0)), res, im->samples, is3d, compressed(f),
+                                                                    vkz_max(f->kind >= 3, V.driver_id == VK_DRIVER_ID_MESA_TURNIP, (int64_t)VKA_ENVF("DM_VK_ZSHARE_MAX_MB", -1.0)), res, im->samples, is3d, compressed(f) || f->bc_dec,
                                                                     (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_DISPLAY)) != 0);
     if (zs) fl |= VK_IMAGE_CREATE_ALIAS_BIT;
     if (g_rswant) { im->w = vkrs_dim(im->w, vka_rs_q); im->h = vkrs_dim(im->h, vka_rs_q); im->rsc = 1; zs = 0; fl &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_ALIAS_BIT; }   // PEANUTS: a scaled render target (vka_resscale.inc): its format list above is the texture's own size's, so it shares as before
@@ -696,7 +729,7 @@ static int gpu_image_over(const uint8_t *mem) {   // caller holds g_tmu; images 
 static int nvn2_sampled_content(const tex_t *t, const vka_fmt *f, unsigned pf, int sampled) {
     static int on = -1; if (on < 0) on = VKA_ENV("DM_VK_STORAGE_FIRST_USE", 1) != 0 && vka_nvn2();   // (vka_nvn2: captures too)
     const nvn_texdesc *d = &t->d;
-    if (!on || !sampled || !t->pool || t->has_layout || compressed(f) || f->kind >= 3) return 0;
+    if (!on || !sampled || !t->pool || t->has_layout || compressed(f) || f->bc_dec || f->kind >= 3) return 0;
     if (pf & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
     if (d->flags & (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) return 0;
     return !gpu_image_over(t->mem);
@@ -710,7 +743,7 @@ static int storage_mode(const tex_t *t, const uint8_t *c, const vka_fmt *f, int 
     // memory where nothing is mapped (no host alias on Android), so mem_any and the other checks below must not read it
     int sp = 0; unsigned pf = 0; if (t->pool && !nvn_pool_live(t->pool, &pf, &sp)) return ST_ZERO;   // a finalized pool: its memory may be unmapped (treg_dead)
     if (sp) return sparse_sampled(t, f) ? ST_SPARSE : ST_ZERO;
-    int linear = (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0, comp = compressed(f);
+    int linear = (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0, comp = compressed(f) || f->bc_dec;
     int is_vid = t->mem && dm_codec_is_video_mem(t->mem, t->L.size, NULL);
     int want = ST_ZERO;
     if (cpuw || t->has_layout) want = ST_TRACK;
@@ -1063,19 +1096,22 @@ static int tbuf_rows_copy(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint3
 static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, size_t lo, size_t hi) {
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f; int tbuf = d->target == NVN_TEXTURE_TARGET_BUFFER;   // PEANUTS: tbuf (see above)
     if (!(im->is_video || tbuf || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) || im->levels > 1 || im->layers > 1 || im->depth > 1 || f->kind >= 3) return 0;
-    uint32_t bx = (im->w + f->bw - 1) / f->bw, by = (im->h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb, st = tbuf ? pitch : im->d.stride ? im->d.stride : d->stride ? d->stride : pitch;
+    uint32_t bx, by, mbw, mbh; size_t pitch; src_geom(f, im->w, im->h, &bx, &by, &pitch, &mbw, &mbh);
+    size_t st = tbuf ? pitch : im->d.stride ? im->d.stride : d->stride ? d->stride : pitch;
     if (st < pitch) return 0;
     uint32_t r0 = (uint32_t)(lo / st), r1 = (uint32_t)((hi + st - 1) / st); if (r1 > by) r1 = by;
     if (r0 >= r1) r0 = 0, r1 = by;
     im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
     img_edges_take(im);
     if (tbuf) { tbuf_rows_copy(im, t, cb, r0, r1, &g_rows_up); return 1; }   // PEANUTS: tbuf (see above)
-    vka_span s; if (!vka_scratch(pitch * (r1 - r0), 16, &s)) return 1;
-    for (uint32_t y = r0; y < r1; y++) memcpy(s.ptr + (size_t)(y - r0) * pitch, t->mem + (size_t)y * st, pitch);
-    uint32_t y0 = r0 * f->bh, y1 = r1 * f->bh > im->h ? im->h : r1 * f->bh;
-    VkBufferImageCopy c = {s.off, bx * f->bw, (r1 - r0) * f->bh, {im->aspect, 0, 0, 1}, {0, (int32_t)y0, 0}, {im->w, y1 - y0, 1}};
+    uint32_t y0 = r0 * mbh, y1 = r1 * mbh > im->h ? im->h : r1 * mbh;
+    size_t dst_pitch = (size_t)im->w * f->bpb, up_sz = f->bc_dec ? dst_pitch * (y1 - y0) : pitch * (r1 - r0);
+    vka_span s; if (!vka_scratch(up_sz, 16, &s)) return 1;
+    if (f->bc_dec) vka_bcn_decode(f->bc_dec, im->w, y1 - y0, bx, t->mem + (size_t)r0 * st, st, s.ptr, dst_pitch);
+    else for (uint32_t y = r0; y < r1; y++) memcpy(s.ptr + (size_t)(y - r0) * pitch, t->mem + (size_t)y * st, pitch);
+    VkBufferImageCopy c = {s.off, f->bc_dec ? im->w : bx * f->bw, f->bc_dec ? (y1 - y0) : (r1 - r0) * f->bh, {im->aspect, 0, 0, 1}, {0, (int32_t)y0, 0}, {im->w, y1 - y0, 1}};
     vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-    g_rows_up += pitch * (r1 - r0);
+    g_rows_up += up_sz;
     return 1;
 }
 // A dense block-linear 2D texture whose pages the CPU wrote since im->stamp (old): only the bands (one row of GOB blocks, one range of the storage) with a written page
@@ -1093,10 +1129,12 @@ static int upload_bands_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb,
     im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
     img_edges_take(im);
     uint64_t up = 0;
-    uint8_t *bst = NULL; uint32_t bst_cap = 0;
+    uint8_t *bst = NULL, *raw = NULL; uint32_t bst_cap = 0; size_t raw_cap = 0;
+    uint32_t mbh = f->bc_dec ? 4 : f->bh;
     for (uint32_t lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1;
-        uint32_t bx = (w + f->bw - 1) / f->bw, by = (h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb;
+        uint32_t bx, by; size_t pitch; src_geom(f, w, h, &bx, &by, &pitch, NULL, NULL);
+        size_t dst_pitch = (size_t)w * f->bpb;
         uint32_t tl = lv + im->base;   // (the texture's level: image level lv is texture level lv + base, a soft texture's)
         uint32_t band_rows = by; uint64_t band_bytes = 0;
         if (nvn_deswizzle_block_rows(d, tl) != (int)by || nvn_deswizzle_bands(d, tl, &band_rows, &band_bytes)) band_rows = by, band_bytes = 0;
@@ -1104,7 +1142,7 @@ static int upload_bands_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb,
             uint64_t off, len; sub_range(d, &im->L, tl, ly, &off, &len);
             if (!len || off + len <= lo || off >= hi) continue;
             uint32_t nb = band_bytes ? (by + band_rows - 1) / band_rows : 1;
-            if (bst_cap < nb) { free(bst); bst_cap = nb; if (!(bst = malloc(bst_cap))) { bst_cap = 0; return 0; } }
+            if (bst_cap < nb) { free(bst); bst_cap = nb; if (!(bst = malloc(bst_cap))) { bst_cap = 0; free(raw); return 0; } }
             int any = 0;
             for (uint32_t k = 0; k < nb; k++) {
                 uint64_t bo = band_bytes ? (uint64_t)k * band_bytes : 0, bl = band_bytes ? (bo < len ? (len - bo < band_bytes ? len - bo : band_bytes) : 0) : len;
@@ -1119,19 +1157,26 @@ static int upload_bands_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb,
                 while (k1 < nb && (size_t)(k1 + 1 - k) * band_rows * pitch <= maxrun && bst[k1]) k1++;
                 if (!band_bytes) k1 = nb;
                 uint32_t y0 = k * band_rows, y1 = k1 * band_rows < by ? k1 * band_rows : by;
-                size_t sz = (size_t)(y1 - y0) * pitch;
-                vka_span s; if (!vka_scratch(sz, 16, &s)) { free(bst); return 0; }
-                if (nvn_deswizzle_rows(d, tl, ly, t->mem, s.ptr - (size_t)y0 * pitch, pitch, y0, y1)) {
-                    VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(bst); return 0; }
-                uint32_t py0 = y0 * f->bh, py1 = y1 * f->bh > h ? h : y1 * f->bh;
-                VkBufferImageCopy cp = {s.off, bx * f->bw, (y1 - y0) * f->bh, {im->aspect, lv, ly, 1}, {0, (int32_t)py0, 0}, {w, py1 - py0, 1}};
+                uint32_t py0 = y0 * mbh, py1 = y1 * mbh > h ? h : y1 * mbh;
+                size_t raw_sz = (size_t)(y1 - y0) * pitch, sz = f->bc_dec ? (size_t)(py1 - py0) * dst_pitch : raw_sz;
+                vka_span s; if (!vka_scratch(sz, 16, &s)) { free(bst); free(raw); return 0; }
+                if (f->bc_dec) {
+                    if (raw_sz > raw_cap) { free(raw); raw_cap = raw_sz; if (!(raw = malloc(raw_cap))) { free(bst); return 0; } }
+                    if (nvn_deswizzle_rows(d, tl, ly, t->mem, raw - (size_t)y0 * pitch, pitch, y0, y1)) {
+                        VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(bst); free(raw); return 0; }
+                    vka_bcn_decode(f->bc_dec, w, py1 - py0, bx, raw, pitch, s.ptr, dst_pitch);
+                } else {
+                    if (nvn_deswizzle_rows(d, tl, ly, t->mem, s.ptr - (size_t)y0 * pitch, pitch, y0, y1)) {
+                        VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(bst); free(raw); return 0; }
+                }
+                VkBufferImageCopy cp = {s.off, f->bc_dec ? w : bx * f->bw, f->bc_dec ? (py1 - py0) : (y1 - y0) * f->bh, {im->aspect, lv, ly, 1}, {0, (int32_t)py0, 0}, {w, py1 - py0, 1}};
                 vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
                 up += sz;
-                if (!(cb = vka_up_point(cb))) { free(bst); return 0; }
+                if (!(cb = vka_up_point(cb))) { free(bst); free(raw); return 0; }
             }
         }
     }
-    free(bst);
+    free(bst); free(raw);
     atomic_fetch_add_explicit(&g_up_bytes, up, memory_order_relaxed);
     return 1;
 }
@@ -1213,12 +1258,12 @@ static void copy_bound(vka_img *im, VkCommandBuffer cb, const vka_span *s, uint3
 // batch may go to the queue (vka_up_point)
 static void upload_sparse_parts(vka_img *im, VkCommandBuffer cb, uint64_t gen, uint64_t stamp, int all, int bind_only) {
     const nvn_texdesc *d = &im->d; const vka_fmt *f = &im->f; uint64_t mem = (uint64_t)(uintptr_t)im->mem;
-    uint8_t *part = NULL, *bst = NULL; uint64_t cap = 0, up = 0, mapped = 0, zeroed = 0; unsigned nsub = 0, nzero = 0; uint32_t bst_cap = 0;
+    uint8_t *part = NULL, *raw = NULL, *bst = NULL; uint64_t cap = 0, up = 0, mapped = 0, zeroed = 0; size_t raw_cap = 0; unsigned nsub = 0, nzero = 0; uint32_t bst_cap = 0;
     int is3d = d->target == NVN_TEXTURE_TARGET_3D;
     for (uint32_t i = 0; i < im->levels && cb; i++) {
         uint32_t lv = i + im->base, w = im->w >> i ? im->w >> i : 1, h = im->h >> i ? im->h >> i : 1;
-        uint32_t bx = (w + f->bw - 1) / f->bw, by = (h + f->bh - 1) / f->bh;
-        size_t pitch = (size_t)bx * f->bpb;
+        uint32_t bx, by; size_t pitch; src_geom(f, w, h, &bx, &by, &pitch, NULL, NULL);
+        size_t dst_pitch = (size_t)w * f->bpb;
         // Bands: block rows and storage bytes of each (a 3D level: one band of all of it)
         uint32_t band_rows = by; uint64_t band_bytes = 0;
         if (is3d || nvn_deswizzle_block_rows(d, lv) != (int)by || nvn_deswizzle_bands(d, lv, &band_rows, &band_bytes)) band_rows = by, band_bytes = 0;
@@ -1256,8 +1301,12 @@ static void upload_sparse_parts(vka_img *im, VkCommandBuffer cb, uint64_t gen, u
                 uint32_t y0 = k * band_rows, y1 = k1 * band_rows < by ? k1 * band_rows : by;
                 if (!st) continue;
                 any = 1;
-                size_t sz = (size_t)(y1 - y0) * pitch * (is3d ? (im->depth >> i ? im->depth >> i : 1) : 1);
-                if (st == 1 && !is3d && zero_rows(im, cb, i, ly, w, h, bx, pitch, y0, y1)) { zeroed += sz; continue; }
+                uint32_t dz = is3d ? (im->depth >> i ? im->depth >> i : 1) : 1;
+                uint32_t mbh = f->bc_dec ? 4 : f->bh;
+                uint32_t py0 = y0 * mbh, py1 = y1 * mbh > h ? h : y1 * mbh;
+                size_t raw_sz = (size_t)(y1 - y0) * pitch * dz;
+                size_t sz = f->bc_dec ? (size_t)(py1 - py0) * dst_pitch * dz : raw_sz;
+                if (st == 1 && !is3d && zero_rows(im, cb, i, ly, w, h, f->bc_dec ? w : bx, f->bc_dec ? dst_pitch : pitch, f->bc_dec ? py0 : y0, f->bc_dec ? py1 : y1)) { zeroed += sz; continue; }
                 vka_span s; if (!vka_scratch(sz, 16, &s)) { VRED("sparse texture serial %llu: no scratch memory for level %u layer %u (%zu bytes)", (unsigned long long)im->serial, lv, ly, sz); goto out; }
                 if (st == 1) { if (is_astc(f->vk)) for (size_t q = 0; q + 16 <= sz; q += 16) memcpy(s.ptr + q, k_astc_zero, 16); else memset(s.ptr, 0, sz); zeroed += sz; }
                 else {
@@ -1266,14 +1315,20 @@ static void upload_sparse_parts(vka_img *im, VkCommandBuffer cb, uint64_t gen, u
                     if (sl > cap) { free(part); cap = sl; if (!(part = malloc(cap))) { VRED("sparse texture serial %llu: copy of %llu bytes not allocated", (unsigned long long)im->serial, (unsigned long long)sl); goto out; } }
                     mapped += sl - nvn_sparse_copy(im->vpool, part, mem + so, sl);
                     if (is_astc(f->vk)) astc_zero_blocks(part, sl);
-                    // the deswizzler reads level lv of layer ly at its offset in the whole storage, and writes row y at y * pitch: part holds just this run's bytes
-                    if (nvn_deswizzle_rows(d, lv, ly, (const uint8_t *)((uintptr_t)part - (uintptr_t)so), s.ptr - (size_t)y0 * pitch, pitch, y0, y1)) {
-                        VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)im->serial, d->format, d->target); goto out; }
+                    if (f->bc_dec) {
+                        if (raw_sz > raw_cap) { free(raw); raw_cap = raw_sz; if (!(raw = malloc(raw_cap))) { VRED("sparse texture serial %llu: decode buffer of %zu bytes not allocated", (unsigned long long)im->serial, raw_sz); goto out; } }
+                        if (nvn_deswizzle_rows(d, lv, ly, (const uint8_t *)((uintptr_t)part - (uintptr_t)so), raw - (size_t)y0 * pitch, pitch, y0, y1)) {
+                            VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)im->serial, d->format, d->target); goto out; }
+                        for (uint32_t iz = 0; iz < dz; iz++)
+                            vka_bcn_decode(f->bc_dec, w, py1 - py0, bx, raw + ((size_t)iz * by) * pitch, pitch, s.ptr + (size_t)iz * (py1 - py0) * dst_pitch, dst_pitch);
+                    } else {
+                        // the deswizzler reads level lv of layer ly at its offset in the whole storage, and writes row y at y * pitch: part holds just this run's bytes
+                        if (nvn_deswizzle_rows(d, lv, ly, (const uint8_t *)((uintptr_t)part - (uintptr_t)so), s.ptr - (size_t)y0 * pitch, pitch, y0, y1)) {
+                            VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)im->serial, d->format, d->target); goto out; }
+                    }
                     up += sz;
                 }
-                uint32_t py0 = y0 * f->bh, py1 = y1 * f->bh > h ? h : y1 * f->bh;
-                uint32_t dz = is3d ? (im->depth >> i ? im->depth >> i : 1) : 1;
-                VkBufferImageCopy c = {s.off, bx * f->bw, (y1 - y0) * f->bh, {im->aspect, i, ly, 1}, {0, (int32_t)py0, 0}, {w, py1 - py0, dz}};
+                VkBufferImageCopy c = {s.off, f->bc_dec ? w : bx * f->bw, f->bc_dec ? (py1 - py0) : (y1 - y0) * f->bh, {im->aspect, i, ly, 1}, {0, (int32_t)py0, 0}, {w, py1 - py0, dz}};
                 if (rt) copy_bound(im, cb, &s, i, ly, w, h, pitch, band_rows, k, k1, y0);   // only the bound tiles (an unbound one takes no write)
                 else vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
                 cb = vka_up_point(cb);
@@ -1286,7 +1341,7 @@ static void upload_sparse_parts(vka_img *im, VkCommandBuffer cb, uint64_t gen, u
         }
     }
 out:
-    free(part); free(bst);
+    free(part); free(raw); free(bst);
     static _Atomic int nl; if (nsub && atomic_fetch_add(&nl, 1) < 64)
         VLOG("sparse texture serial %llu %ux%u layers %u levels %u+%u of %u format %#x: %u levels x layers uploaded (%u with nothing mapped), %.1f MiB through staging, %.1f MiB of zero texels, %.1f MiB of pages mapped behind them%s",
              (unsigned long long)im->serial, im->d.width, im->d.height, im->layers, im->base, im->levels, im->base + im->levels, d->format, nsub, nzero, up / 1048576.0, zeroed / 1048576.0, mapped / 1048576.0, all ? "" : " (changed since the last upload)");
@@ -1524,7 +1579,7 @@ static int soft_on(void) {
 static int soft_want(const tex_t *t, const vka_fmt *f, int mode) {   // caller holds g_tmu
     if (mode != ST_TRACK && mode != ST_FILL) return 0;
     const nvn_texdesc *d = &t->d;
-    vksoft_tex c = {(uint32_t)d->width, (uint32_t)d->height, (uint32_t)d->levels, d->samples > 1 ? (uint32_t)d->samples : 1, f->bw, t->has_layout, t->mem != NULL,
+    vksoft_tex c = {(uint32_t)d->width, (uint32_t)d->height, (uint32_t)d->levels, d->samples > 1 ? (uint32_t)d->samples : 1, f->bc_dec ? (uint8_t)4 : f->bw, t->has_layout, t->mem != NULL,
                     d->target == NVN_TEXTURE_TARGET_2D || d->target == NVN_TEXTURE_TARGET_2D_ARRAY, t->pool && pool_sparse(t->pool),
                     (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0};
     return f->kind < 3 && vksoft_candidate(&c) && !vksoft_has(&g_soft_hard, (uint64_t)(uintptr_t)t->mem) && soft_on();
@@ -1554,7 +1609,7 @@ static int img_kind(const vka_img *im) {
     if (im->gpu_owned) return IK_GPU;
     if (im->m.z) return IK_ZERO_SHARED;
     if (im->mode == ST_SPARSE || im->rs) return IK_SPARSE;
-    if (im->mode == ST_TRACK || im->mode == ST_FILL) return im->f.bw > 1 ? IK_BC : IK_RAW;
+    if (im->mode == ST_TRACK || im->mode == ST_FILL) return (im->f.bw > 1 || im->f.bc_dec) ? IK_BC : IK_RAW;
     return IK_CLEARED;
 }
 static int img_keep_reason(const vka_img *im, uint64_t cur, uint64_t done) {
@@ -1959,7 +2014,7 @@ VkImageView vka_view(vka_img *im, VkFormat fmt, VkImageViewType type, VkImageAsp
     int listed = img_lists(im, fmt) || fmt == raw_unorm_twin(im->f.vk);
     if (!listed) {   // a format outside the image's format list (img_create): its own format instead; the pair is learned for the images made from now on (Learned view formats)
         int learned = 0;   // (only uncompressed colour formats of one texel size: vl_learn checks the pair)
-        if (im->f.kind <= 2 && !compressed(&im->f)) { pthread_mutex_lock(&g_vlmu); learned = vl_learn(im->f.vk, fmt, im->rsc ? (uint32_t)im->d.width : im->w, im->rsc ? (uint32_t)im->d.height : im->h); /* PEANUTS: by the texture's size for a scaled image (DM_RES_SCALE) */ pthread_mutex_unlock(&g_vlmu); }
+        if (im->f.kind <= 2 && !compressed(&im->f) && !im->f.bc_dec) { pthread_mutex_lock(&g_vlmu); learned = vl_learn(im->f.vk, fmt, im->rsc ? (uint32_t)im->d.width : im->w, im->rsc ? (uint32_t)im->d.height : im->h); /* PEANUTS: by the texture's size for a scaled image (DM_RES_SCALE) */ pthread_mutex_unlock(&g_vlmu); }
         if (learned)
             VLOG("image VkFormat %d (NVN %#x, %ux%u) asked for a view as VkFormat %d, which its format list does not have: viewed in its own format; learned (images of this format and size made from now on, and in the next runs, take it)", im->f.vk, im->d.format, im->w, im->h, fmt);
         else { static struct { VkFormat a, b; } seen[32]; static int ns; int k = 0;
@@ -1993,18 +2048,34 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
 // and layer) are cut into runs of block rows (nvn_deswizzle_rows, at least ~64 KB each) that the helpers and the calling thread take in turn; the copies are recorded after
 // all of them, in the same order as before. Only uploads of at least DM_VK_UPLOAD_MT_MIN bytes (default 256 KB): the first uploads of a level's textures came in loading
 // frames, 1-93 textures a frame, all deswizzled on the replay thread one after another
-typedef struct { const nvn_texdesc *d; const uint8_t *src; uint8_t *dst; size_t pitch; uint32_t lv, ly, y0, y1; _Atomic int *bad; } up_part;   // bad: its piece's flag
+typedef struct {
+    const nvn_texdesc *d; const uint8_t *src; uint8_t *dst; size_t pitch;
+    uint32_t lv, ly, y0, y1; _Atomic int *bad;
+    uint8_t bc_dec; uint32_t w, h, z, bx, by; uint8_t *bc_dst; size_t dst_pitch;
+} up_part;   // bad: its piece's flag
 // A part is claimed by compare-and-swap on next while next < n: a helper that wakes late, or comes back from the last batch, can only claim a part of the batch being set up
 // once it is complete (p, then next = 0, then n; n = 0 between batches)
 static struct { pthread_mutex_t mu; pthread_cond_t cv, done_cv; _Atomic(up_part *) p; _Atomic uint32_t n, next, done; _Atomic int fail; uint64_t gen; int nth; } UP = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
 static pthread_mutex_t g_up_one = PTHREAD_MUTEX_INITIALIZER;   // one parallel upload at a time (another thread's upload runs on its own thread)
+static int up_part_exec(const up_part *q) {
+    if (nvn_deswizzle_rows(q->d, q->lv, q->ly, q->src, q->dst, q->pitch, q->y0, q->y1)) return 1;
+    if (q->bc_dec) {
+        uint32_t py0 = q->y0 * 4, py1 = q->y1 * 4 < q->h ? q->y1 * 4 : q->h;
+        if (py1 > py0) {
+            for (uint32_t iz = 0; iz < q->z; iz++)
+                vka_bcn_decode(q->bc_dec, q->w, py1 - py0, q->bx, q->dst + ((size_t)iz * q->by + q->y0) * q->pitch, q->pitch,
+                               q->bc_dst + ((size_t)iz * q->h + py0) * q->dst_pitch, q->dst_pitch);
+        }
+    }
+    return 0;
+}
 static void up_run(void) {   // take parts until none is left
     for (;;) {
         uint32_t i = atomic_load(&UP.next), n = atomic_load(&UP.n);
         if (i >= n) return;
         if (!atomic_compare_exchange_weak(&UP.next, &i, i + 1)) continue;
         up_part *q = &atomic_load(&UP.p)[i];
-        if (nvn_deswizzle_rows(q->d, q->lv, q->ly, q->src, q->dst, q->pitch, q->y0, q->y1)) { atomic_store(&UP.fail, 1); atomic_store(q->bad, 1); }
+        if (up_part_exec(q)) { atomic_store(&UP.fail, 1); atomic_store(q->bad, 1); }
         if (atomic_fetch_add(&UP.done, 1) + 1 == n) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.done_cv); pthread_mutex_unlock(&UP.mu); }
     }
 }
@@ -2042,33 +2113,37 @@ static int upload_mt(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *
     uint64_t total = 0; uint32_t npieces = im->levels * im->layers;
     for (uint32_t lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
-        total += (uint64_t)((w + f->bw - 1) / f->bw) * f->bpb * ((h + f->bh - 1) / f->bh) * z * im->layers;
+        uint32_t bx, by; size_t sp; src_geom(f, w, h, &bx, &by, &sp, NULL, NULL);
+        total += (f->bc_dec ? (uint64_t)w * f->bpb * h : (uint64_t)sp * by) * z * im->layers;
     }
     int minb = VKA_ENV("DM_VK_UPLOAD_MT_MIN", 256 << 10);
     if (total < (uint64_t)(minb > 0 ? minb : 1) || npieces > 4096 || VKA_ENV("DM_VK_UPLOAD_MT", 3) <= 0) return 0;
-    typedef struct { vka_span s; uint32_t lv, ly, w, h, z, bx, by; size_t pitch; _Atomic int bad; } piece_t;
-    piece_t *pc = malloc(npieces * sizeof *pc); up_part *parts = NULL; uint32_t np = 0, cap = 0;
+    typedef struct { vka_span s; uint8_t *raw; uint32_t lv, ly, w, h, z, bx, by; size_t pitch, dst_pitch; _Atomic int bad; } piece_t;
+    piece_t *pc = calloc(npieces, sizeof *pc); up_part *parts = NULL; uint32_t np = 0, cap = 0;
     if (!pc) return 0;
     uint32_t k = 0;
     for (uint32_t lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
-        uint32_t bx = (w + f->bw - 1) / f->bw, by = (h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb, piece = pitch * by * z;
+        uint32_t bx, by; size_t pitch; src_geom(f, w, h, &bx, &by, &pitch, NULL, NULL);
+        size_t raw_piece = pitch * by * z, dst_pitch = (size_t)w * f->bpb, piece = f->bc_dec ? dst_pitch * h * z : raw_piece;
         int rows = nvn_deswizzle_block_rows(d, lv + im->base);   // (the texture's level: image level lv is texture level lv + base, a soft texture's)
-        if (rows < 0 || (uint32_t)rows != by) { free(pc); free(parts); return 0; }   // (a shape the serial path reports)
+        if (rows < 0 || (uint32_t)rows != by) { for (uint32_t i = 0; i < k; i++) free(pc[i].raw); free(pc); free(parts); return 0; }   // (a shape the serial path reports)
         for (uint32_t ly = 0; ly < im->layers; ly++, k++) {
-            piece_t *q = &pc[k]; *q = (piece_t){{0}, lv, ly, w, h, z, bx, by, pitch, 0};
-            if (!vka_scratch(piece, 16, &q->s)) goto cut;   // (no scratch: as the serial path, the pieces before it are uploaded)
+            piece_t *q = &pc[k]; *q = (piece_t){{0}, NULL, lv, ly, w, h, z, bx, by, pitch, dst_pitch, 0};
+            if (f->bc_dec && !(q->raw = malloc(raw_piece))) goto cut;
+            if (!vka_scratch(piece, 16, &q->s)) { free(q->raw); q->raw = NULL; goto cut; }   // (no scratch: as the serial path, the pieces before it are uploaded)
             // Runs of block rows of at least ~64 KB (all slices of a 3D level in each)
             uint32_t per = (uint32_t)((65536 + pitch * z - 1) / (pitch * z)); if (!per) per = 1;
             for (uint32_t y = 0; y < by; y += per) {
-                if (np == cap) { cap = cap ? cap * 2 : 64; up_part *n2 = realloc(parts, cap * sizeof *parts); if (!n2) { free(pc); free(parts); return 0; } parts = n2; }
-                parts[np++] = (up_part){d, t->mem, q->s.ptr, pitch, lv + im->base, ly, y, y + per < by ? y + per : by, &q->bad};
+                if (np == cap) { cap = cap ? cap * 2 : 64; up_part *n2 = realloc(parts, cap * sizeof *parts); if (!n2) { for (uint32_t i = 0; i <= k; i++) free(pc[i].raw); free(pc); free(parts); return 0; } parts = n2; }
+                parts[np++] = (up_part){d, t->mem, f->bc_dec ? q->raw : q->s.ptr, pitch, lv + im->base, ly, y, y + per < by ? y + per : by, &q->bad,
+                                        f->bc_dec, w, h, z, bx, by, q->s.ptr, dst_pitch};
             }
         }
     }
 cut:;
     int fail = 0;
-    if (!up_parallel(parts, np, &fail)) { for (uint32_t i = 0; i < np; i++) if (nvn_deswizzle_rows(parts[i].d, parts[i].lv, parts[i].ly, parts[i].src, parts[i].dst, parts[i].pitch, parts[i].y0, parts[i].y1)) { fail = 1; *parts[i].bad = 1; } }
+    if (!up_parallel(parts, np, &fail)) { for (uint32_t i = 0; i < np; i++) if (up_part_exec(&parts[i])) { fail = 1; *parts[i].bad = 1; } }
     free(parts);
     // A piece that could not be deswizzled ends the upload there, as on the serial path: the pieces before it are copied, it and those after it are not
     if (fail) VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target);
@@ -2076,10 +2151,11 @@ cut:;
     for (uint32_t i = 0; i < k; i++) {
         piece_t *q = &pc[i];
         if (atomic_load(&q->bad)) break;
-        VkBufferImageCopy c = {q->s.off, q->bx * f->bw, q->by * f->bh, {im->aspect, q->lv, q->ly, 1}, {0, 0, 0}, {q->w, q->h, q->z}};
+        VkBufferImageCopy c = {q->s.off, f->bc_dec ? q->w : q->bx * f->bw, f->bc_dec ? q->h : q->by * f->bh, {im->aspect, q->lv, q->ly, 1}, {0, 0, 0}, {q->w, q->h, q->z}};
         vk.vkCmdCopyBufferToImage(cb, q->s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-        bytes += q->pitch * q->by * q->z;
+        bytes += (f->bc_dec ? q->dst_pitch * q->h : q->pitch * q->by) * q->z;
     }
+    for (uint32_t i = 0; i < k; i++) free(pc[i].raw);
     free(pc);
     *nbytes = bytes;
     return 1;
@@ -2102,25 +2178,38 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
     uint64_t bytes = 0;
     // A sparse pool's texture: gathered from its page table by bands, unmapped ones as zero texels (until 2026-11-03 a copy of its whole range was made first)
     if (im->vpool) { if (!im->vbind) upload_sparse_parts(im, cb, 0, 0, 1, 0); return; }   // (a GPU-written one's content is the GPU's: sparse_bind)
-    uint8_t *part = NULL; const uint8_t *src = t->mem;
+    uint8_t *part = NULL; size_t part_cap = 0; const uint8_t *src = t->mem;
     for (uint32_t lv = 0; lv < (linear ? 1 : im->levels); lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
-        uint32_t bx = (w + f->bw - 1) / f->bw, by = (h + f->bh - 1) / f->bh;
-        size_t pitch = (size_t)bx * f->bpb, piece = pitch * by * z;
+        uint32_t bx, by; size_t pitch; src_geom(f, w, h, &bx, &by, &pitch, NULL, NULL);
+        size_t raw_piece = pitch * by * z, dst_pitch = (size_t)w * f->bpb, piece = f->bc_dec ? dst_pitch * h * z : raw_piece;
+        size_t st = im->d.stride ? im->d.stride : d->stride ? d->stride : pitch;
         for (uint32_t ly = 0; ly < (linear ? 1 : im->layers); ly++) {
             vka_span s; if (!vka_scratch(piece, 16, &s)) { free(part); return; }
-            if (linear) { size_t st = im->d.stride ? im->d.stride : d->stride ? d->stride : pitch; for (uint32_t y = 0; y < by; y++) memcpy(s.ptr + y * pitch, src + y * st, pitch); }
-            else if (nvn_deswizzle(d, lv + im->base, ly, src, s.ptr, pitch)) { VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(part); return; }   // (image level lv is texture level lv + base: a soft texture's; a sparse pool's go above)
-            if (d->format >= 0x79 && d->format <= 0x94 && vka_nan_on()) {   // DM_VK_NANSCAN: all-zero blocks of ASTC textures (an all-zero ASTC block is an error block)
-                uint64_t zb = 0, nb = piece / 16; for (uint64_t k = 0; k < nb; k++) if (!mem_any(s.ptr + 16 * k, 16)) zb++;
-                const char *dm = getenv("DM_VK_NANSCAN_DUMP"); static _Atomic int nd;   // <format>x<w>: level 0 of such textures written to DM_TEMP (diagnostic, at most 64)
-                if (dm && lv == 0 && ly == 0 && (int)strtol(dm, NULL, 16) == d->format && (uint32_t)atoi(strchr(dm, 'x') ? strchr(dm, 'x') + 1 : "0") == im->w && atomic_fetch_add(&nd, 1) < 64) {
-                    char fn[512]; snprintf(fn, sizeof fn, "%s/nan-%llu-%#x-%ux%u.blk", getenv("DM_TEMP") ? getenv("DM_TEMP") : "/data/local/tmp", (unsigned long long)t->serial, d->format, w, h);
-                    FILE *fo = fopen(fn, "wb"); if (fo) { fwrite(s.ptr, 1, piece, fo); fclose(fo); VLOG("NaN scan: level 0 of serial %llu written to %s", (unsigned long long)t->serial, fn); }
+            if (f->bc_dec) {
+                if (linear) {
+                    for (uint32_t iz = 0; iz < z; iz++)
+                        vka_bcn_decode(f->bc_dec, w, h, bx, src + (size_t)iz * by * st, st, s.ptr + (size_t)iz * h * dst_pitch, dst_pitch);
+                } else {
+                    if (raw_piece > part_cap) { free(part); part_cap = raw_piece; if (!(part = malloc(part_cap))) { free(part); return; } }
+                    if (nvn_deswizzle(d, lv + im->base, ly, src, part, pitch)) { VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(part); return; }
+                    for (uint32_t iz = 0; iz < z; iz++)
+                        vka_bcn_decode(f->bc_dec, w, h, bx, part + (size_t)iz * by * pitch, pitch, s.ptr + (size_t)iz * h * dst_pitch, dst_pitch);
                 }
-                static _Atomic int nz; if (zb && atomic_fetch_add(&nz, 1) < 64) VLOG("NaN scan: upload of serial %llu format %#x level %u layer %u: %llu of %llu blocks all zero (storage %p)", (unsigned long long)t->serial, d->format, lv, ly, (unsigned long long)zb, (unsigned long long)nb, (const void *)t->mem);
+            } else {
+                if (linear) { for (uint32_t y = 0; y < by; y++) memcpy(s.ptr + y * pitch, src + y * st, pitch); }
+                else if (nvn_deswizzle(d, lv + im->base, ly, src, s.ptr, pitch)) { VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(part); return; }   // (image level lv is texture level lv + base: a soft texture's; a sparse pool's go above)
+                if (d->format >= 0x79 && d->format <= 0x94 && vka_nan_on()) {   // DM_VK_NANSCAN: all-zero blocks of ASTC textures (an all-zero ASTC block is an error block)
+                    uint64_t zb = 0, nb = piece / 16; for (uint64_t k = 0; k < nb; k++) if (!mem_any(s.ptr + 16 * k, 16)) zb++;
+                    const char *dm = getenv("DM_VK_NANSCAN_DUMP"); static _Atomic int nd;   // <format>x<w>: level 0 of such textures written to DM_TEMP (diagnostic, at most 64)
+                    if (dm && lv == 0 && ly == 0 && (int)strtol(dm, NULL, 16) == d->format && (uint32_t)atoi(strchr(dm, 'x') ? strchr(dm, 'x') + 1 : "0") == im->w && atomic_fetch_add(&nd, 1) < 64) {
+                        char fn[512]; snprintf(fn, sizeof fn, "%s/nan-%llu-%#x-%ux%u.blk", getenv("DM_TEMP") ? getenv("DM_TEMP") : "/data/local/tmp", (unsigned long long)t->serial, d->format, w, h);
+                        FILE *fo = fopen(fn, "wb"); if (fo) { fwrite(s.ptr, 1, piece, fo); fclose(fo); VLOG("NaN scan: level 0 of serial %llu written to %s", (unsigned long long)t->serial, fn); }
+                    }
+                    static _Atomic int nz; if (zb && atomic_fetch_add(&nz, 1) < 64) VLOG("NaN scan: upload of serial %llu format %#x level %u layer %u: %llu of %llu blocks all zero (storage %p)", (unsigned long long)t->serial, d->format, lv, ly, (unsigned long long)zb, (unsigned long long)nb, (const void *)t->mem);
+                }
             }
-            VkBufferImageCopy c = {s.off, bx * f->bw, by * f->bh, {im->aspect, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
+            VkBufferImageCopy c = {s.off, f->bc_dec ? w : bx * f->bw, f->bc_dec ? h : by * f->bh, {im->aspect, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
             vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
             bytes += piece;
             if (!(cb = vka_up_point(cb))) { free(part); *nbytes = bytes; return; }
@@ -2192,7 +2281,7 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
              im->w, im->h, im->layers, im->d.format, im->m.size / 1048576.0, (unsigned long long)vka_frame(), file, line, im->nsamp, im->novl); }
     im->gpu_owned = 1;
     im->last_fence = vka_fence_last();
-    if ((im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && !im->wb_pending && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1) {
+    if ((im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && !im->wb_pending && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1 && !im->f.bc_dec) {
         if (g_nwb == g_wbcap) { g_wbcap = g_wbcap ? 2 * g_wbcap : 32; g_wb = realloc(g_wb, (size_t)g_wbcap * sizeof *g_wb); }
         im->wb_pending = 1; im->refs++; g_wb[g_nwb++] = im;
     }
@@ -2334,7 +2423,7 @@ void mtl_tex_write_region(const tex_t *t, unsigned level, unsigned layer0, const
     // and only valid Vulkan usage inside the image: otherwise the storage holds the write and the next prepare reads all of it
     uint32_t lw = im->w >> level ? im->w >> level : 1, lh = im->h >> level ? im->h >> level : 1;
     // (an image from a finer texture level, a soft or sparse texture's: im->base, its levels are not the texture's; the whole re-upload maps them)
-    if (f->kind >= 3 || im->m.z || im->is_video || im->base || im->rsc /* PEANUTS: a scaled image (DM_RES_SCALE): the region is the texture's pixels; the whole upload makes it 1x first */ || level >= im->levels || layer0 + (unsigned)r->zoffset + (unsigned)nz > im->layers ||
+    if (f->kind >= 3 || f->bc_dec || im->m.z || im->is_video || im->base || im->rsc /* PEANUTS: a scaled image (DM_RES_SCALE): the region is the texture's pixels; the whole upload makes it 1x first */ || level >= im->levels || layer0 + (unsigned)r->zoffset + (unsigned)nz > im->layers ||
         r->xoffset < 0 || r->yoffset < 0 || r->width <= 0 || r->height <= 0 ||
         (uint64_t)r->xoffset + (uint64_t)r->width > lw || (uint64_t)r->yoffset + (uint64_t)r->height > lh) {
         redo_add_locked(im);
@@ -2753,7 +2842,7 @@ static int img_storage_upgrade(vka_img *im, VkCommandBuffer cb, VkFormat need) {
 // A shader-image binding's view format need, when it is another uncompressed format of im's texel size that im's format list lacks: the pair is learned for every size of
 // image-intent textures (vl_formats), and need is returned for the caller to remake im with it (img_storage_upgrade). UNDEFINED: none needed, or the pair cannot be listed
 static VkFormat img_view_learn_fmt(VkFormat need, vka_img *im) {
-    if (!need || need == im->f.vk || im->f.kind > 2 || compressed(&im->f)) return VK_FORMAT_UNDEFINED;
+    if (!need || need == im->f.vk || im->f.kind > 2 || compressed(&im->f) || im->f.bc_dec) return VK_FORMAT_UNDEFINED;
     pthread_mutex_lock(&g_tmu); int listed = img_lists(im, need); pthread_mutex_unlock(&g_tmu);
     if (listed) return VK_FORMAT_UNDEFINED;
     pthread_mutex_lock(&g_vlmu);
@@ -2965,7 +3054,7 @@ int vka_tex_id_tbuf(int id, int want, int storage, uint64_t *addr, uint64_t *byt
     pthread_mutex_lock(&g_tmu);
     if (id > 0 && id < g_ntreg && g_treg[id].t.serial && g_treg[id].t.d.target == NVN_TEXTURE_TARGET_BUFFER && g_treg[id].t.mem) {
         const treg_ent *e = &g_treg[id]; vka_fmt f;
-        if (vka_fmt_of(e->has_v && e->v.set_format ? e->v.format : e->t.d.format, &f) && f.bw == 1 && f.bh == 1 && f.kind < 3 && f.bpb) {
+        if (vka_fmt_of(e->has_v && e->v.set_format ? e->v.format : e->t.d.format, &f) && f.bw == 1 && f.bh == 1 && !f.bc_dec && f.kind < 3 && f.bpb) {
             int have = f.kind == 1 ? 1 : f.kind == 2 ? 2 : 0; VkFormat vf = f.vk;
             if (want != have) vf = class_twin(f.vk, want);
             uint64_t n = (uint64_t)e->t.d.width * f.bpb; if (e->t.L.size && n > e->t.L.size) n = e->t.L.size / f.bpb * f.bpb;
@@ -3025,7 +3114,7 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     int want = dim & DMSH_VK_DIM_SINT ? 2 : dim & DMSH_VK_DIM_UINT ? 1 : 0, have = vf.kind == 1 ? 1 : vf.kind == 2 ? 2 : 0;
     VkFormat ovr = VK_FORMAT_UNDEFINED;
     if (force) {   // (vka_tex_id_view_bits: a colour format of 4-byte texels)
-        if (vf.bw != 1 || vf.bh != 1 || vf.bpb != 4 || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { pthread_mutex_lock(&g_tmu); im_unhold_locked(im); pthread_mutex_unlock(&g_tmu); return VK_NULL_HANDLE; }
+        if (vf.bw != 1 || vf.bh != 1 || vf.bc_dec || vf.bpb != 4 || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { pthread_mutex_lock(&g_tmu); im_unhold_locked(im); pthread_mutex_unlock(&g_tmu); return VK_NULL_HANDLE; }
         ovr = force;
     } else if (want != have && !(vf.kind >= 3 && want == 0)) {
         // Another class (a compute pass reading a UINT texture as float, or the reverse: Ocarina of Time's UI pass, R16G16_UINT): a view in the same-size format of the shader's

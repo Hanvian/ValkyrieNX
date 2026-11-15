@@ -776,7 +776,11 @@ public final class Library {
             int n = PeanutsPrefs.roots(a).size();
             note = PUi.add(box, PUi.small(a, "Looking in " + n + (n == 1 ? " folder…" : " folders…")), 8);
         } else if (rows.isEmpty() && pc == null && !setup) {
-            note = PUi.add(box, PUi.small(a, "No games found in " + PeanutsPrefs.gameDir(a) + ". Put NSP, XCI, .nup files or dump folders there, then Rescan (Settings › Library)."), 8);
+            boolean singleGame = Upstream.profiles().size() == 1;
+            String gameNote = singleGame
+                    ? "No Breath of the Wild files found in " + PeanutsPrefs.gameDir(a) + ". Add your base .nsp/.xci, .nup, or existing built BotW folder there, then Rescan (Settings › Library)."
+                    : "No games found in " + PeanutsPrefs.gameDir(a) + ". Put NSP, XCI, .nup files or dump folders there, then Rescan (Settings › Library).";
+            note = PUi.add(box, PUi.small(a, gameNote), 8);
         }
         if (note != null && !hadNote) Motion.fadeIn(note);
         hadNote = note != null;

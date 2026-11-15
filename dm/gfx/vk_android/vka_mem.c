@@ -414,7 +414,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow) {
     if (V.fd_alias) {
         r = vka_fd_create(&vk, V.pd, V.dev, &V.memp, n, V.bda, &exported);
         if (r) { VRED("pool memory %#lx+%#llx: exported allocation %d", (unsigned long)lo, (unsigned long long)n, r); return 0; }
-        s.buf = exported.buf; s.mem = exported.mem; s.fd_alias = 1;
+        s.buf = exported.buf; s.mem = exported.mem; s.fd_alias = exported.fd_map_only ? 2 : 1;
     } else {
         if (!(s.buf = seg_buffer(n))) { VRED("pool memory %#lx+%#llx: vkCreateBuffer failed", (unsigned long)lo, (unsigned long long)n); return 0; }
         VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, s.buf, &mr);
@@ -461,6 +461,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow) {
         }
     }
     if (exported.fd >= 0) close(exported.fd);
+    if (exported.fd_map_only && exported.mapped) { munmap(exported.mapped, exported.map_size); exported.mapped = NULL; }
     static int pf = -1; if (pf < 0) { const char *e = getenv("DM_VK_PREFAULT"); pf = !(e && !strcmp(e, "0")); if (!pf) VLOG("DM_VK_PREFAULT=0: placed maps are not faulted in (a diagnostic: DM_VK_NANSCAN's placed memory test shows whether the driver needs it)"); }
     p3 = mono_ns();
     if (ok && pf) prefault(lo, hi);   // before any mprotect splits the mapping (see prefault)
@@ -476,7 +477,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow) {
     g_ph[3] += p3 - p2; g_ph[4] += p4 - p3; g_ph[5] += p5 - p4;
     if (!(++g_ph_n & 255)) VLOG("placed memory: %llu placements: allocation %.0f ms, protections read %.0f ms (%.0f lines of /proc/self/maps a read), copy %.0f ms, maps %.0f ms, prefault %.0f ms, protections back %.0f ms; %d memory maps of %d at the last count",
                                (unsigned long long)g_ph_n, g_ph[0] / 1e6, g_ph[1] / 1e6, (double)g_maps_lines / g_ph_n, g_ph[2] / 1e6, g_ph[3] / 1e6, g_ph[4] / 1e6, g_ph[5] / 1e6, atomic_load(&g_maps_n), atomic_load(&g_maps_max));
-    if (!ok) { VRED("pool memory %#lx+%#llx: placed map %d at %p", (unsigned long)lo, (unsigned long long)n, r, p); if (s.fd_alias) vk.vkUnmapMemory(V.dev, s.mem); vk.vkDestroyBuffer(V.dev, s.buf, NULL); vk.vkFreeMemory(V.dev, s.mem, NULL); return 0; }
+    if (!ok) { VRED("pool memory %#lx+%#llx: placed map %d at %p", (unsigned long)lo, (unsigned long long)n, r, p); if (s.fd_alias == 1) vk.vkUnmapMemory(V.dev, s.mem); vk.vkDestroyBuffer(V.dev, s.buf, NULL); vk.vkFreeMemory(V.dev, s.mem, NULL); return 0; }
     if (V.bda) { VkBufferDeviceAddressInfo bai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = s.buf}; s.bda = vk.vkGetBufferDeviceAddress(V.dev, &bai); }
     if (!lock_whole()) pthread_rwlock_wrlock(&g_rw);
     sg_insert(&s);
@@ -532,7 +533,7 @@ static void detach(int i, segvec *v) {   // caller holds g_pl, and g_rw for writ
 // Memory the GPU is not known to be done with (the wait ran into the hang time, or a GPU hang was declared) is never freed: it stays allocated (leaked) behind the anonymous pages,
 // since a free under work the GPU still runs faults the GPU (freed anyway after 2 s before, on the way to a system restart on the phone)
 static void seg_free(const seg_t *s, int waited, uint64_t fence) {
-    if (waited) { if (s->fd_alias) vk.vkUnmapMemory(V.dev, s->mem); vk.vkDestroyBuffer(V.dev, s->buf, NULL); vk.vkFreeMemory(V.dev, s->mem, NULL); return; }
+    if (waited) { if (s->fd_alias == 1) vk.vkUnmapMemory(V.dev, s->mem); vk.vkDestroyBuffer(V.dev, s->buf, NULL); vk.vkFreeMemory(V.dev, s->mem, NULL); return; }
     static _Atomic int nk; if (atomic_fetch_add(&nk, 1) < 8) VRED("giving back pool memory %#lx+%#zx: the GPU is not known to be done with it (fence %llu%s): its Vulkan memory is kept, not freed",
                                                                (unsigned long)s->lo, (size_t)(s->hi - s->lo), (unsigned long long)fence, vka_hung() ? ", GPU hang" : " not reached in the hang time");
 }

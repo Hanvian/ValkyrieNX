@@ -127,6 +127,8 @@ final class LibraryScanner {
         Map<String, String> catalogNames = CompanionPort.names(ctx);
         List<Upstream.Entry> list = Upstream.games(ctx);
         String gameDir = PeanutsPrefs.gameDir(ctx);
+        boolean singleGame = profiles.size() == 1;
+        List<Title> out = new ArrayList<>();
         for (Title t : titles.values()) {
             // the home folder and what to launch
             if (t.base != null && t.base.isDump()) { t.home = t.base.file; t.launch = t.base.file; }
@@ -143,8 +145,10 @@ final class LibraryScanner {
             if (t.name == null) for (Upstream.Entry e : list) if (e.titleId.equals(t.titleId) && !e.name.isEmpty()) { t.name = e.name; break; }
             if (t.name == null || t.name.isEmpty()) t.name = t.titleId;
             // the status
-            if (!profiles.containsKey(t.titleId)) t.status = Status.NO_PROFILE;
-            else {
+            if (!profiles.containsKey(t.titleId)) {
+                if (singleGame) continue;
+                t.status = Status.NO_PROFILE;
+            } else {
                 t.packDir = packOf(t, list);
                 t.status = t.launch != null && t.packDir != null ? Status.READY : Status.BUILD;
             }
@@ -152,8 +156,8 @@ final class LibraryScanner {
             // P1: the version state (not computed for READY: the pack already fits, and for NO_PROFILE the sheet's Profile.missing sentence is the whole story)
             if (t.status == Status.NO_PROFILE) t.versionState = VersionState.NOT_IN_APP;
             else if (t.status == Status.BUILD) t.versionState = versionState(t);
+            out.add(t);
         }
-        List<Title> out = new ArrayList<>(titles.values());
         Collections.sort(out, (a, b) -> a.name.compareToIgnoreCase(b.name));
         return out;
     }
@@ -186,16 +190,37 @@ final class LibraryScanner {
         return titles;
     }
 
-    /** The pack for a title: upstream's list when it has the game ready, else a pack.tsv in <home>/<ID>-work/<any>/ or <home's parent>/<ID>-work/<any>/ */
+    /** The pack for a title: upstream's list when it has the game ready, else the configured build folder's pack, else a matching pack.tsv in <home>/{pack,android-pack,<ID>-work/<any>} or <home's parent>/<ID>-work/<any> */
     private File packOf(Title t, List<Upstream.Entry> list) {
         if (t.launch == null) return null;
         for (Upstream.Entry e : list) if (e.ready && samePath(e.gameDir, t.launch.getPath())) return new File(e.packDir);
+        File buildPack = PeanutsPrefs.buildPackDir(ctx, t.titleId);
+        if (isPackFor(buildPack, t.titleId)) return buildPack;
+        for (String sub : new String[] {"pack", "android-pack"}) {
+            if (t.home != null && isPackFor(new File(t.home, sub), t.titleId)) return new File(t.home, sub);
+        }
         for (File h : new File[] {t.home, t.home == null ? null : t.home.getParentFile()}) {
             if (h == null) continue;
             File[] kids = new File(h, t.titleId + "-work").listFiles(File::isDirectory);
-            if (kids != null) for (File k : kids) if (new File(k, "pack.tsv").isFile()) return k;
+            if (kids != null) for (File k : kids) if (isPackFor(k, t.titleId)) return k;
         }
         return null;
+    }
+
+    private static boolean isPackFor(File dir, String titleId) {
+        if (dir == null) return false;
+        File tsv = new File(dir, "pack.tsv");
+        if (!tsv.isFile()) return false;
+        try {
+            List<String> lines = Files.readAllLines(tsv.toPath(), StandardCharsets.UTF_8);
+            for (int i = 0; i < Math.min(lines.size(), 16); i++) {
+                String line = lines.get(i);
+                if (line.startsWith("title_id\t")) return line.substring(9).trim().equalsIgnoreCase(titleId);
+            }
+        } catch (IOException e) {
+            return false;
+        }
+        return true;
     }
 
     private static boolean samePath(String a, String b) {

@@ -14,11 +14,14 @@ static VkBufferUsageFlags vka_guest_usage(int bda) {
            VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | (bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
 }
 
-typedef struct { VkBuffer buf; VkDeviceMemory mem; void *mapped; int fd; } vka_fd_memory;
+typedef struct { VkBuffer buf; VkDeviceMemory mem; void *mapped; int fd; int fd_map_only; size_t map_size; } vka_fd_memory;
 
 static void vka_fd_destroy(vka_fns *f, VkDevice dev, vka_fd_memory *m) {
     if (m->fd >= 0) close(m->fd);
-    if (m->mapped) f->vkUnmapMemory(dev, m->mem);
+    if (m->mapped) {
+        if (m->fd_map_only) munmap(m->mapped, m->map_size);
+        else f->vkUnmapMemory(dev, m->mem);
+    }
     if (m->buf) f->vkDestroyBuffer(dev, m->buf, NULL);
     if (m->mem) f->vkFreeMemory(dev, m->mem, NULL);
     *m = (vka_fd_memory){.fd = -1};
@@ -37,18 +40,37 @@ static VkResult vka_fd_create(vka_fns *f, VkPhysicalDevice pd, VkDevice dev, con
     VkResult r = f->vkCreateBuffer(dev, &bi, NULL, &out->buf); if (r) return r;
     VkMemoryRequirements mr; f->vkGetBufferMemoryRequirements(dev, out->buf, &mr);
     uint32_t type = UINT32_MAX; const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    int host_visible = 1;
     for (uint32_t i = 0; i < mp->memoryTypeCount; i++) if ((mr.memoryTypeBits & (1u << i)) && (mp->memoryTypes[i].propertyFlags & hv) == hv) {
         if (type == UINT32_MAX || (mp->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) type = i;
+    }
+    if (type == UINT32_MAX) {
+        // Exynos Xclipse SPAL exposes exportable OPAQUE_FD buffers on DEVICE_LOCAL memory without HOST_VISIBLE;
+        // allocate there and mmap the exported fd directly rather than calling vkMapMemory.
+        host_visible = 0;
+        for (uint32_t i = 0; i < mp->memoryTypeCount; i++) if (mr.memoryTypeBits & (1u << i)) {
+            if (type == UINT32_MAX || ((mp->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                                       !(mp->memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))) type = i;
+        }
     }
     if (type == UINT32_MAX) { r = VK_ERROR_FEATURE_NOT_PRESENT; goto fail; }
     VkMemoryAllocateFlagsInfo af = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = bda ? &af : NULL, .buffer = out->buf};
     VkExportMemoryAllocateInfo ex = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .pNext = &ded, .handleTypes = qi.handleType};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ex, .allocationSize = mr.size, .memoryTypeIndex = type};
-    if ((r = f->vkAllocateMemory(dev, &ai, NULL, &out->mem)) || (r = f->vkBindBufferMemory(dev, out->buf, out->mem, 0)) ||
-        (r = f->vkMapMemory(dev, out->mem, 0, VK_WHOLE_SIZE, 0, &out->mapped))) goto fail;
+    if ((r = f->vkAllocateMemory(dev, &ai, NULL, &out->mem)) || (r = f->vkBindBufferMemory(dev, out->buf, out->mem, 0))) goto fail;
     VkMemoryGetFdInfoKHR gi = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = out->mem, .handleType = qi.handleType};
     if ((r = f->vkGetMemoryFdKHR(dev, &gi, &out->fd))) goto fail;
+    if (host_visible) {
+        if ((r = f->vkMapMemory(dev, out->mem, 0, VK_WHOLE_SIZE, 0, &out->mapped))) goto fail;
+    } else {
+        size_t msz = (size_t)(mr.size ? mr.size : n);
+        void *p = mmap(NULL, msz, PROT_READ | PROT_WRITE, MAP_SHARED, out->fd, 0);
+        if (p == MAP_FAILED) { r = VK_ERROR_MEMORY_MAP_FAILED; goto fail; }
+        out->mapped = p;
+        out->fd_map_only = 1;
+        out->map_size = msz;
+    }
     return VK_SUCCESS;
 fail:
     vka_fd_destroy(f, dev, out); return r;

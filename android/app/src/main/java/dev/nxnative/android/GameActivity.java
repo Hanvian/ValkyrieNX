@@ -278,8 +278,12 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         GpuDriver.Info drv = GpuDriver.selected(this, titleId());
         String st = Native.skipStatus();
         Native.note("skipped work: notice shown (" + pct + " % of draws; driver: " + (drv == null ? "system" : drv.label()) + ")");
+        java.util.Map<String, String> sysFacts = Prefs.facts(this, Recommend.SYSTEM);
+        boolean systemOnly = drv == null && !sysFacts.isEmpty() && !Readiness.customDriversFit(sysFacts);
         TextView h = new TextView(this);
-        h.setText(SkipNotice.noMesh(st) ? SkipNotice.textNoMesh(pct) : SkipNotice.text(pct, drv == null ? null : drv.label()));
+        h.setText(SkipNotice.noMesh(st) ? SkipNotice.textNoMesh(pct)
+                : systemOnly ? "Part of the picture is not drawn on the system GPU driver (" + pct + " % of draws skipped)."
+                : SkipNotice.text(pct, drv == null ? null : drv.label()));
         h.setTextColor(Color.WHITE);
         h.setTextSize(13);
         float dp = getResources().getDisplayMetrics().density;

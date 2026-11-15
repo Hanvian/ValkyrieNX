@@ -51,3 +51,7 @@ app_pool	0xCD500000
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /Layout/=layout /System/=gsys /Terrain/=terrain
 shader_note	Breath of the Wild shaders
+
+# ---- Recommended settings ----
+# Samsung Xclipse GPUs (gpu.vendor=0x144d) run directly on the system Vulkan driver via opaque_fd mmap and compute BCn decode (dm/games/README.md "Recommended settings").
+recommend	gpu.vendor=0x144d	driver=system

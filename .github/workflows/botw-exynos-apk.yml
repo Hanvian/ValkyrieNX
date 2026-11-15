@@ -1,0 +1,92 @@
+name: Build BotW Exynos APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - botw-exynos
+
+jobs:
+  build-botw-exynos:
+    name: Test & Build The Legends Of Zelda BoTW (Exynos) APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install Python test dependencies
+        run: python -m pip install lz4 "capstone>=5,<6" fonttools
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            zsh cmake ninja-build glslang-tools spirv-tools libdigest-sha-perl clang curl
+
+      - name: Set up Android SDK and NDK 28.2.13676358
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-36" "build-tools;35.0.0" "cmake;3.22.1" "ndk;28.2.13676358"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Run Android tool, readiness, and JVM tests
+        run: |
+          for f in dm/tools/tests/test_android*.py; do
+            echo "::group::$f"
+            python -m unittest -v "$f"
+            echo "::endgroup::"
+          done
+          sh peanuts/scripts/check-runtime-profile.sh
+
+      - name: Build on-device packer stage (arm64-v8a)
+        run: |
+          chmod +x peanuts/scripts/*.sh android/ondevice/build.sh \
+            dm/gfx/tools/dmsh_xlate_android/*.sh \
+            dm/third_party/zstd-zbic/build.sh \
+            dm/peanuts/pack_worker/build.sh
+          zsh peanuts/scripts/ondevice-stage.sh /tmp/botw-stage
+
+      - name: Build single-game BotW Exynos APK
+        run: |
+          cd android/app
+          chmod +x gradlew
+          ./gradlew --no-daemon apk \
+            -PnxPackStage=/tmp/botw-stage/stage \
+            -PnxApp=peanuts \
+            -PnxGames=01007EF00011E000 \
+            -PnxLabel="The Legends Of Zelda: BoTW" \
+            -PnxVersion=0.1.1-exynos \
+            -PnxVersionCode=1
+          ls -lh out/
+
+      - name: Upload BotW Exynos APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: The-Legends-Of-Zelda-BoTW-Exynos-APK
+          path: android/app/out/*.apk
+          if-no-files-found: error
+          retention-days: 14

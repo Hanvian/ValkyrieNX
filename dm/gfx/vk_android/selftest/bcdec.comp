@@ -1,0 +1,486 @@
+#version 450
+// GPU software decoder for BC4 / BC5 / BC6H / BC7 blocks (fallback for drivers lacking hardware BC4-7, e.g. Samsung Xclipse SPAL).
+// Decodes block-linear/strided compressed blocks in Src (binding 0) into unpacked 4-pixel-aligned scanlines in Dst (binding 1).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, std430, binding = 0) readonly buffer SrcBuf { uint src[]; };
+layout(set = 0, std430, binding = 1) writeonly buffer DstBuf { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    uint kind;            // 1 BC4_UNORM, 2 BC4_SNORM, 3 BC5_UNORM, 4 BC5_SNORM, 5 BC6H_SFLOAT, 6 BC6H_UFLOAT, 7 BC7
+    uint bx;              // blocks across
+    uint by;              // blocks high
+    uint layers;          // array layers or depth slices
+    uint src_row_words;   // stride in uints between block rows in src
+    uint src_layer_words; // stride in uints between layers in src
+    uint dst_row_words;   // stride in uints between pixel rows in dst (= bx * block_row_words)
+    uint dst_layer_words; // stride in uints between layers in dst (= by * 4 * dst_row_words)
+} pc;
+
+const uint k_part2[64] = uint[64](
+    0x50505050u, 0x40404040u, 0x54545454u, 0x54505040u,
+    0x50404000u, 0x55545450u, 0x55545040u, 0x54504000u,
+    0x50400000u, 0x55555450u, 0x55544000u, 0x54400000u,
+    0x55555440u, 0x55550000u, 0x55555500u, 0x55000000u,
+    0x55150100u, 0x00004054u, 0x15010000u, 0x00405054u,
+    0x00004050u, 0x15050100u, 0x05010000u, 0x40505054u,
+    0x00404050u, 0x05010100u, 0x14141414u, 0x05141450u,
+    0x01155440u, 0x00555500u, 0x15014054u, 0x05414150u,
+    0x44444444u, 0x55005500u, 0x11441144u, 0x05055050u,
+    0x05500550u, 0x11114444u, 0x41144114u, 0x44111144u,
+    0x15055054u, 0x01055040u, 0x05041050u, 0x05455150u,
+    0x14414114u, 0x50050550u, 0x41411414u, 0x00141400u,
+    0x00041504u, 0x00105410u, 0x10541000u, 0x04150400u,
+    0x50410514u, 0x41051450u, 0x05415014u, 0x14054150u,
+    0x41050514u, 0x41505014u, 0x40011554u, 0x54150140u,
+    0x50505500u, 0x00555050u, 0x15151010u, 0x54540404u
+);
+
+const uint k_part3[64] = uint[64](
+    0xaa685050u, 0x6a5a5040u, 0x5a5a4200u, 0x5450a0a8u,
+    0xa5a50000u, 0xa0a05050u, 0x5555a0a0u, 0x5a5a5050u,
+    0xaa550000u, 0xaa555500u, 0xaaaa5500u, 0x90909090u,
+    0x94949494u, 0xa4a4a4a4u, 0xa9a59450u, 0x2a0a4250u,
+    0xa5945040u, 0x0a425054u, 0xa5a5a500u, 0x55a0a0a0u,
+    0xa8a85454u, 0x6a6a4040u, 0xa4a45000u, 0x1a1a0500u,
+    0x0050a4a4u, 0xaaa59090u, 0x14696914u, 0x69691400u,
+    0xa08585a0u, 0xaa821414u, 0x50a4a450u, 0x6a5a0200u,
+    0xa9a58000u, 0x5090a0a8u, 0xa8a09050u, 0x24242424u,
+    0x00aa5500u, 0x24924924u, 0x24499224u, 0x50a50a50u,
+    0x500aa550u, 0xaaaa4444u, 0x66660000u, 0xa5a0a5a0u,
+    0x50a050a0u, 0x69286928u, 0x44aaaa44u, 0x66666600u,
+    0xaa444444u, 0x54a854a8u, 0x95809580u, 0x96969600u,
+    0xa85454a8u, 0x80959580u, 0xaa141414u, 0x96960000u,
+    0xaaaa1414u, 0xa05050a0u, 0xa0a5a5a0u, 0x96000000u,
+    0x40804080u, 0xa9a8a9a8u, 0xaaaaaa44u, 0x2a4a5254u
+);
+
+const uint k_anc0[64] = uint[64](
+    0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,
+    0xfu,0x2u,0x8u,0x2u,0x2u,0x8u,0x8u,0xfu,0x2u,0x8u,0x2u,0x2u,0x8u,0x8u,0x2u,0x2u,
+    0xfu,0xfu,0x6u,0x8u,0x2u,0x8u,0xfu,0xfu,0x2u,0x8u,0x2u,0x2u,0x2u,0xfu,0xfu,0x6u,
+    0x6u,0x2u,0x6u,0x8u,0xfu,0xfu,0x2u,0x2u,0xfu,0xfu,0xfu,0xfu,0xfu,0x2u,0x2u,0xfu
+);
+
+const uint k_anc1[64] = uint[64](
+    0x3u,0x3u,0xfu,0xfu,0x8u,0x3u,0xfu,0xfu,0x8u,0x8u,0x6u,0x6u,0x6u,0x5u,0x3u,0x3u,
+    0x3u,0x3u,0x8u,0xfu,0x3u,0x3u,0x6u,0xau,0x5u,0x8u,0x8u,0x6u,0x8u,0x5u,0xfu,0xfu,
+    0x8u,0xfu,0x3u,0x5u,0x6u,0xau,0x8u,0xfu,0xfu,0x3u,0xfu,0x5u,0xfu,0xfu,0xfu,0xfu,
+    0x3u,0xfu,0x5u,0x5u,0x5u,0x8u,0x5u,0xau,0x5u,0xau,0x8u,0xdu,0xfu,0xcu,0x3u,0x3u
+);
+
+const uint k_anc2[64] = uint[64](
+    0xfu,0x8u,0x8u,0x3u,0xfu,0xfu,0x3u,0x8u,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0x8u,
+    0xfu,0x8u,0xfu,0x3u,0xfu,0x8u,0xfu,0x8u,0x3u,0xfu,0x6u,0xau,0xfu,0xfu,0xau,0x8u,
+    0xfu,0x3u,0xfu,0xau,0xau,0x8u,0x9u,0xau,0x6u,0xfu,0x8u,0xfu,0x3u,0x6u,0x6u,0x8u,
+    0xfu,0x3u,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0xfu,0x3u,0xfu,0xfu,0x8u
+);
+
+uint getbits(uvec4 b, uint pos, uint n) {
+    if (n == 0u) return 0u;
+    uint wi = pos >> 5u;
+    uint sh = pos & 31u;
+    uint w0 = wi == 0u ? b.x : (wi == 1u ? b.y : (wi == 2u ? b.z : b.w));
+    uint lo = w0 >> sh;
+    if (sh + n > 32u) {
+        uint wi1 = wi + 1u;
+        uint w1 = wi1 == 1u ? b.y : (wi1 == 2u ? b.z : (wi1 == 3u ? b.w : 0u));
+        lo |= w1 << (32u - sh);
+    }
+    return lo & ((1u << n) - 1u);
+}
+
+int sext(int v, uint bits) {
+    int m = 1 << int(bits - 1u);
+    return (v ^ m) - m;
+}
+
+int bptc_interp(int a, int b, uint idx, uint bits) {
+    uint w = 0u;
+    if (bits == 2u) {
+        w = idx == 0u ? 0u : (idx == 1u ? 21u : (idx == 2u ? 43u : 64u));
+    } else if (bits == 3u) {
+        const uint w3[8] = uint[8](0u, 9u, 18u, 27u, 37u, 46u, 55u, 64u);
+        w = w3[idx];
+    } else {
+        const uint w4[16] = uint[16](0u, 4u, 9u, 13u, 17u, 21u, 26u, 30u, 34u, 38u, 43u, 47u, 51u, 55u, 60u, 64u);
+        w = w4[idx];
+    }
+    return ((64 - int(w)) * a + int(w) * b + 32) >> 6;
+}
+
+uint bc4_byte_u(uvec2 blk, uint texel) {
+    uint e0 = blk.x & 0xffu;
+    uint e1 = (blk.x >> 8u) & 0xffu;
+    uint bitpos = 16u + texel * 3u;
+    uint c = ((bitpos < 32u)
+        ? ((blk.x >> bitpos) | ((bitpos + 3u > 32u) ? (blk.y << (32u - bitpos)) : 0u))
+        : (blk.y >> (bitpos - 32u))) & 7u;
+    if (c == 0u) return e0;
+    if (c == 1u) return e1;
+    if (e0 > e1) {
+        uint i = c - 2u;
+        return ((6u - i) * e0 + (i + 1u) * e1 + 3u) / 7u;
+    }
+    if (c == 6u) return 0u;
+    if (c == 7u) return 255u;
+    uint i = c - 2u;
+    return ((4u - i) * e0 + (i + 1u) * e1 + 2u) / 5u;
+}
+
+uint bc4_byte_s(uvec2 blk, uint texel) {
+    int s0 = sext(int(blk.x & 0xffu), 8u);
+    int s1 = sext(int((blk.x >> 8u) & 0xffu), 8u);
+    int e0 = s0 == -128 ? -127 : s0;
+    int e1 = s1 == -128 ? -127 : s1;
+    uint bitpos = 16u + texel * 3u;
+    uint c = ((bitpos < 32u)
+        ? ((blk.x >> bitpos) | ((bitpos + 3u > 32u) ? (blk.y << (32u - bitpos)) : 0u))
+        : (blk.y >> (bitpos - 32u))) & 7u;
+    int outv;
+    if (c == 0u) outv = e0;
+    else if (c == 1u) outv = e1;
+    else if (e0 > e1) {
+        int i = int(c) - 2;
+        int v = (6 - i) * e0 + (i + 1) * e1;
+        outv = v >= 0 ? (v + 3) / 7 : (v - 3) / 7;
+    } else if (c == 6u) outv = -127;
+    else if (c == 7u) outv = 127;
+    else {
+        int i = int(c) - 2;
+        int v = (4 - i) * e0 + (i + 1) * e1;
+        outv = v >= 0 ? (v + 2) / 5 : (v - 2) / 5;
+    }
+    return uint(outv) & 0xffu;
+}
+
+uint bc7_expand(uint v, uint bits) {
+    return bits == 8u ? v : (((v << (8u - bits)) | (v >> (2u * bits - 8u))) & 0xffu);
+}
+
+void decode_bc7(uvec4 blk, uint dst_base) {
+    uint b0 = blk.x & 0xffu;
+    if (b0 == 0u) {
+        for (uint y = 0u; y < 4u; y++) {
+            uint row = dst_base + y * pc.dst_row_words;
+            dst[row] = 0u; dst[row + 1u] = 0u; dst[row + 2u] = 0u; dst[row + 3u] = 0u;
+        }
+        return;
+    }
+    uint m = 0u;
+    while (((b0 >> m) & 1u) == 0u) m++;
+    // {n_subsets, n_part_bits, has_rot, has_idx_sel, n_color_bits, n_alpha_bits, has_ep_pbits, has_sh_pbits, n_idx_bits, n_idx2_bits}
+    const uint m_sub[8] = uint[8](3u, 2u, 3u, 2u, 1u, 1u, 1u, 2u);
+    const uint m_part[8] = uint[8](4u, 6u, 6u, 6u, 0u, 0u, 0u, 6u);
+    const uint m_rot[8] = uint[8](0u, 0u, 0u, 0u, 1u, 1u, 0u, 0u);
+    const uint m_isel[8] = uint[8](0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u);
+    const uint m_cb[8] = uint[8](4u, 6u, 5u, 7u, 5u, 7u, 7u, 5u);
+    const uint m_ab[8] = uint[8](0u, 0u, 0u, 0u, 6u, 8u, 7u, 5u);
+    const uint m_epp[8] = uint[8](1u, 0u, 0u, 1u, 0u, 0u, 1u, 1u);
+    const uint m_shp[8] = uint[8](0u, 1u, 0u, 0u, 0u, 0u, 0u, 0u);
+    const uint m_i1[8] = uint[8](3u, 3u, 2u, 2u, 2u, 2u, 4u, 2u);
+    const uint m_i2[8] = uint[8](0u, 0u, 0u, 0u, 3u, 2u, 0u, 0u);
+
+    uint nsub = m_sub[m], npb = m_part[m], hrot = m_rot[m], hisel = m_isel[m];
+    uint ncb = m_cb[m], nab = m_ab[m], hepp = m_epp[m], hshp = m_shp[m];
+    uint ni1 = m_i1[m], ni2 = m_i2[m];
+    uint bit = m + 1u;
+
+    uint part = getbits(blk, bit, npb);
+    bit += npb;
+    uint subsets = nsub == 1u ? 0u : (nsub == 2u ? k_part2[part] : k_part3[part]);
+    uint rot = hrot != 0u ? getbits(blk, bit, 2u) : 0u;
+    bit += hrot * 2u;
+    uint isel = hisel != 0u ? getbits(blk, bit, 1u) : 0u;
+    bit += hisel;
+
+    uint ep[6][4];
+    for (uint c = 0u; c < 3u; c++) {
+        for (uint s = 0u; s < nsub; s++) {
+            for (uint e = 0u; e < 2u; e++) {
+                ep[s * 2u + e][c] = getbits(blk, bit, ncb);
+                bit += ncb;
+            }
+        }
+    }
+    uint ncomp = 3u;
+    if (nab > 0u) {
+        for (uint s = 0u; s < nsub; s++) {
+            for (uint e = 0u; e < 2u; e++) {
+                ep[s * 2u + e][3] = getbits(blk, bit, nab);
+                bit += nab;
+            }
+        }
+        ncomp = 4u;
+    } else {
+        for (uint s = 0u; s < nsub; s++) {
+            for (uint e = 0u; e < 2u; e++) ep[s * 2u + e][3] = 255u;
+        }
+    }
+    if (hepp != 0u) {
+        for (uint s = 0u; s < nsub; s++) {
+            for (uint e = 0u; e < 2u; e++) {
+                uint pb = getbits(blk, bit, 1u); bit += 1u;
+                for (uint c = 0u; c < ncomp; c++) ep[s * 2u + e][c] = (ep[s * 2u + e][c] << 1u) | pb;
+            }
+        }
+    } else if (hshp != 0u) {
+        for (uint s = 0u; s < nsub; s++) {
+            uint pb = getbits(blk, bit, 1u); bit += 1u;
+            for (uint e = 0u; e < 2u; e++) {
+                for (uint c = 0u; c < ncomp; c++) ep[s * 2u + e][c] = (ep[s * 2u + e][c] << 1u) | pb;
+            }
+        }
+    }
+    uint cb = ncb + hepp + hshp;
+    uint ab = nab + hepp + hshp;
+    for (uint s = 0u; s < nsub; s++) {
+        for (uint e = 0u; e < 2u; e++) {
+            for (uint c = 0u; c < 3u; c++) ep[s * 2u + e][c] = bc7_expand(ep[s * 2u + e][c], cb);
+            if (nab > 0u) ep[s * 2u + e][3] = bc7_expand(ep[s * 2u + e][3], ab);
+        }
+    }
+
+    for (uint y = 0u; y < 4u; y++) {
+        uint row = dst_base + y * pc.dst_row_words;
+        for (uint x = 0u; x < 4u; x++) {
+            uint texel = y * 4u + x;
+            uint anc = texel > 0u ? 1u : 0u;
+            if (nsub == 2u && texel > k_anc0[part]) anc++;
+            else if (nsub == 3u) {
+                if (texel > k_anc1[part]) anc++;
+                if (texel > k_anc2[part]) anc++;
+            }
+            uint is_anc = 0u;
+            if (texel == 0u) is_anc = 1u;
+            else if (nsub == 2u && k_anc0[part] == texel) is_anc = 1u;
+            else if (nsub == 3u && (k_anc1[part] == texel || k_anc2[part] == texel)) is_anc = 1u;
+
+            uint off1 = bit + ni1 * texel - anc;
+            uint off2 = bit + 16u * ni1 - nsub + ni2 * texel - anc;
+            uint sub = (subsets >> (texel * 2u)) & 3u;
+            uint i0 = getbits(blk, off1, ni1 - is_anc);
+            uint i1 = ni2 != 0u ? getbits(blk, off2, ni2 - is_anc) : 0u;
+
+            uint ci = isel != 0u ? i1 : i0;
+            uint cb_i = isel != 0u ? ni2 : ni1;
+            uint px[4];
+            for (uint c = 0u; c < 3u; c++)
+                px[c] = uint(bptc_interp(int(ep[sub * 2u][c]), int(ep[sub * 2u + 1u][c]), ci, cb_i)) & 0xffu;
+
+            uint ai = (ni2 != 0u && isel == 0u) ? i1 : i0;
+            uint ab_i = (ni2 != 0u && isel == 0u) ? ni2 : ni1;
+            px[3] = uint(bptc_interp(int(ep[sub * 2u][3]), int(ep[sub * 2u + 1u][3]), ai, ab_i)) & 0xffu;
+
+            if (rot != 0u) {
+                uint t = px[rot - 1u];
+                px[rot - 1u] = px[3];
+                px[3] = t;
+            }
+            dst[row + x] = px[0] | (px[1] << 8u) | (px[2] << 16u) | (px[3] << 24u);
+        }
+    }
+}
+
+int bc6_unq(int v, uint bits, bool is_signed) {
+    if (is_signed) {
+        if (bits >= 16u || v == 0) return v;
+        bool neg = v < 0;
+        if (neg) v = -v;
+        v = (v >= (1 << int(bits - 1u)) - 1) ? 0x7fff : (((v << 15) + 0x4000) >> int(bits - 1u));
+        return neg ? -v : v;
+    }
+    if (bits >= 15u || v == 0) return v;
+    if (v == (1 << int(bits)) - 1) return 0xffff;
+    return ((v << 15) + 0x4000) >> int(bits - 1u);
+}
+
+void bc6_bf(uvec4 blk, inout uint bit, inout int ep[4][3], uint desc) {
+    uint e = desc & 3u;
+    uint c = (desc >> 2u) & 3u;
+    uint off = (desc >> 4u) & 15u;
+    uint nbits = (desc >> 8u) & 15u;
+    uint rev = (desc >> 12u) & 1u;
+    uint v = getbits(blk, bit, nbits);
+    bit += nbits;
+    if (rev != 0u) {
+        for (uint i = 0u; i < nbits; i++) {
+            if ((v & (1u << i)) != 0u) ep[e][c] |= (1 << int((nbits - 1u - i) + off));
+        }
+    } else {
+        ep[e][c] |= int(v) << int(off);
+    }
+}
+
+#define BF(e, c, off, n, r) ((uint(e)) | (uint(c) << 2u) | (uint(off) << 4u) | (uint(n) << 8u) | (uint(r) << 12u))
+
+void decode_bc6h(uvec4 blk, uint dst_base, bool is_signed) {
+    uint b0 = blk.x & 0xffu;
+    uint mnum, bit;
+    if ((b0 & 2u) != 0u) { mnum = (((b0 >> 1u) & 0xeu) | (b0 & 1u)) + 2u; bit = 5u; }
+    else { mnum = b0 & 3u; bit = 2u; }
+
+    // Packed BC6H mode descriptor tables matching k_bc6_modes in vka_bcn.h:
+    const uint k_bfs[220] = uint[220](
+        // m0 (idx 0, len 19): tr=1 part=5 ep=10 idx=3 db={5,5,5}
+        BF(2,1,4,1,0),BF(2,2,4,1,0),BF(3,2,4,1,0),BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+        // m1 (idx 19, len 23): tr=1 part=5 ep=7 idx=3 db={6,6,6}
+        BF(2,1,5,1,0),BF(3,1,4,1,0),BF(3,1,5,1,0),BF(0,0,0,7,0),BF(3,2,0,1,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,7,0),BF(2,2,5,1,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,7,0),BF(3,2,3,1,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0),
+        // m2 (idx 42, len 18): tr=1 part=5 ep=11 idx=3 db={5,4,4}
+        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,5,0),BF(0,0,10,1,0),BF(2,1,0,4,0),BF(1,1,0,4,0),BF(0,1,10,1,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,4,0),BF(0,2,10,1,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+        // m3 (idx 60, len 6): tr=0 part=0 ep=10 idx=4 db={10,10,10}
+        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,10,0),BF(1,1,0,10,0),BF(1,2,0,10,0),
+        // m4 (idx 66, len 20): tr=1 part=5 ep=11 idx=3 db={4,5,4}
+        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,1,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(0,1,10,1,0),BF(3,1,0,4,0),BF(1,2,0,4,0),BF(0,2,10,1,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,4,0),BF(3,2,0,1,0),BF(3,2,2,1,0),BF(3,0,0,4,0),BF(2,1,4,1,0),BF(3,2,3,1,0),
+        // m5 (idx 86, len 9): tr=1 part=0 ep=11 idx=4 db={9,9,9}
+        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,9,0),BF(0,0,10,1,0),BF(1,1,0,9,0),BF(0,1,10,1,0),BF(1,2,0,9,0),BF(0,2,10,1,0),
+        // m6 (idx 95, len 20): tr=1 part=5 ep=11 idx=3 db={4,4,5}
+        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,1,0),BF(2,2,4,1,0),BF(2,1,0,4,0),BF(1,1,0,4,0),BF(0,1,10,1,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(0,2,10,1,0),BF(2,2,0,4,0),BF(2,0,0,4,0),BF(3,2,1,1,0),BF(3,2,2,1,0),BF(3,0,0,4,0),BF(3,2,4,1,0),BF(3,2,3,1,0),
+        // m7 (idx 115, len 9): tr=1 part=0 ep=12 idx=4 db={8,8,8}
+        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,8,0),BF(0,0,10,2,1),BF(1,1,0,8,0),BF(0,1,10,2,1),BF(1,2,0,8,0),BF(0,2,10,2,1),
+        // m8 (idx 124, len 19): tr=1 part=5 ep=9 idx=3 db={5,5,5}
+        BF(0,0,0,9,0),BF(2,2,4,1,0),BF(0,1,0,9,0),BF(2,1,4,1,0),BF(0,2,0,9,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+        // m9 (idx 143, len 9): tr=1 part=0 ep=16 idx=4 db={4,4,4}
+        BF(0,0,0,10,0),BF(0,1,0,10,0),BF(0,2,0,10,0),BF(1,0,0,4,0),BF(0,0,10,6,1),BF(1,1,0,4,0),BF(0,1,10,6,1),BF(1,2,0,4,0),BF(0,2,10,6,1),
+        // m10 (idx 152, len 19): tr=1 part=5 ep=8 idx=3 db={6,5,5}
+        BF(0,0,0,8,0),BF(3,1,4,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,2,3,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0),
+        // m12 (idx 171, len 21): tr=1 part=5 ep=8 idx=3 db={5,6,5}
+        BF(0,0,0,8,0),BF(3,2,0,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(2,1,5,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,1,5,1,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,5,0),BF(3,2,1,1,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+        // m14 (idx 192, len 21): tr=1 part=5 ep=8 idx=3 db={5,5,6}
+        BF(0,0,0,8,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,8,0),BF(2,2,5,1,0),BF(2,1,4,1,0),BF(0,2,0,8,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,5,0),BF(3,1,4,1,0),BF(2,1,0,4,0),BF(1,1,0,5,0),BF(3,2,0,1,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,5,0),BF(3,2,2,1,0),BF(3,0,0,5,0),BF(3,2,3,1,0),
+        // m16 (idx 213, dummy placeholder unused by loop length) - actually m16 has 23 fields; let's check index below
+        0u,0u,0u,0u,0u,0u,0u
+    );
+    const uint k_bfs16[23] = uint[23](
+        BF(0,0,0,6,0),BF(3,1,4,1,0),BF(3,2,0,1,0),BF(3,2,1,1,0),BF(2,2,4,1,0),BF(0,1,0,6,0),BF(2,1,5,1,0),BF(2,2,5,1,0),BF(3,2,2,1,0),BF(2,1,4,1,0),BF(0,2,0,6,0),BF(3,1,5,1,0),BF(3,2,3,1,0),BF(3,2,5,1,0),BF(3,2,4,1,0),BF(1,0,0,6,0),BF(2,1,0,4,0),BF(1,1,0,6,0),BF(3,1,0,4,0),BF(1,2,0,6,0),BF(2,2,0,4,0),BF(2,0,0,6,0),BF(3,0,0,6,0)
+    );
+
+    uint bf_off = 0u, bf_len = 0u, tr = 0u, pb = 0u, epb = 0u, ib = 0u, db0 = 0u, db1 = 0u, db2 = 0u;
+    bool res = false;
+    if (mnum == 0u)       { bf_off = 0u;   bf_len = 19u; tr = 1u; pb = 5u; epb = 10u; ib = 3u; db0 = 5u; db1 = 5u; db2 = 5u; }
+    else if (mnum == 1u)  { bf_off = 19u;  bf_len = 23u; tr = 1u; pb = 5u; epb = 7u;  ib = 3u; db0 = 6u; db1 = 6u; db2 = 6u; }
+    else if (mnum == 2u)  { bf_off = 42u;  bf_len = 18u; tr = 1u; pb = 5u; epb = 11u; ib = 3u; db0 = 5u; db1 = 4u; db2 = 4u; }
+    else if (mnum == 3u)  { bf_off = 60u;  bf_len = 6u;  tr = 0u; pb = 0u; epb = 10u; ib = 4u; db0 = 10u; db1 = 10u; db2 = 10u; }
+    else if (mnum == 4u)  { bf_off = 66u;  bf_len = 20u; tr = 1u; pb = 5u; epb = 11u; ib = 3u; db0 = 4u; db1 = 5u; db2 = 4u; }
+    else if (mnum == 5u)  { bf_off = 86u;  bf_len = 9u;  tr = 1u; pb = 0u; epb = 11u; ib = 4u; db0 = 9u; db1 = 9u; db2 = 9u; }
+    else if (mnum == 6u)  { bf_off = 95u;  bf_len = 20u; tr = 1u; pb = 5u; epb = 11u; ib = 3u; db0 = 4u; db1 = 4u; db2 = 5u; }
+    else if (mnum == 7u)  { bf_off = 115u; bf_len = 9u;  tr = 1u; pb = 0u; epb = 12u; ib = 4u; db0 = 8u; db1 = 8u; db2 = 8u; }
+    else if (mnum == 8u)  { bf_off = 124u; bf_len = 19u; tr = 1u; pb = 5u; epb = 9u;  ib = 3u; db0 = 5u; db1 = 5u; db2 = 5u; }
+    else if (mnum == 9u)  { bf_off = 143u; bf_len = 9u;  tr = 1u; pb = 0u; epb = 16u; ib = 4u; db0 = 4u; db1 = 4u; db2 = 4u; }
+    else if (mnum == 10u) { bf_off = 152u; bf_len = 19u; tr = 1u; pb = 5u; epb = 8u;  ib = 3u; db0 = 6u; db1 = 5u; db2 = 5u; }
+    else if (mnum == 12u) { bf_off = 171u; bf_len = 21u; tr = 1u; pb = 5u; epb = 8u;  ib = 3u; db0 = 5u; db1 = 6u; db2 = 5u; }
+    else if (mnum == 14u) { bf_off = 192u; bf_len = 21u; tr = 1u; pb = 5u; epb = 8u;  ib = 3u; db0 = 5u; db1 = 5u; db2 = 6u; }
+    else if (mnum == 16u) { bf_len = 23u; tr = 0u; pb = 5u; epb = 6u;  ib = 3u; db0 = 6u; db1 = 6u; db2 = 6u; }
+    else res = true;
+
+    if (res) {
+        for (uint y = 0u; y < 4u; y++) {
+            uint row = dst_base + y * pc.dst_row_words;
+            for (uint x = 0u; x < 4u; x++) {
+                dst[row + x * 2u] = 0u;
+                dst[row + x * 2u + 1u] = 0x3c00u << 16u;
+            }
+        }
+        return;
+    }
+
+    int ep[4][3];
+    for (uint e = 0u; e < 4u; e++) { ep[e][0] = 0; ep[e][1] = 0; ep[e][2] = 0; }
+    if (mnum == 16u) {
+        for (uint i = 0u; i < 23u; i++) bc6_bf(blk, bit, ep, k_bfs16[i]);
+    } else {
+        for (uint i = 0u; i < bf_len; i++) bc6_bf(blk, bit, ep, k_bfs[bf_off + i]);
+    }
+
+    uint n_ep = pb != 0u ? 4u : 2u;
+    uint db[3] = uint[3](db0, db1, db2);
+    if (tr != 0u) {
+        int mask = (1 << int(epb)) - 1;
+        for (uint e = 1u; e < n_ep; e++) {
+            for (uint c = 0u; c < 3u; c++) {
+                int d = sext(ep[e][c], db[c]);
+                ep[e][c] = (ep[0][c] + d) & mask;
+            }
+        }
+    }
+    for (uint e = 0u; e < n_ep; e++) {
+        for (uint c = 0u; c < 3u; c++) {
+            int v = is_signed ? sext(ep[e][c], epb) : ep[e][c];
+            ep[e][c] = bc6_unq(v, epb, is_signed);
+        }
+    }
+
+    uint part = 0u, nsub = 1u, subsets = 0u;
+    if (pb != 0u) {
+        part = getbits(blk, bit, pb) & 31u;
+        bit += pb;
+        subsets = k_part2[part];
+        nsub = 2u;
+    }
+
+    for (uint y = 0u; y < 4u; y++) {
+        uint row = dst_base + y * pc.dst_row_words;
+        for (uint x = 0u; x < 4u; x++) {
+            uint texel = y * 4u + x;
+            uint anc = texel > 0u ? 1u : 0u;
+            if (nsub == 2u && texel > k_anc0[part]) anc++;
+            uint is_anc = (texel == 0u || (nsub == 2u && k_anc0[part] == texel)) ? 1u : 0u;
+            uint sub = (subsets >> (texel * 2u)) & 3u;
+            uint idx = getbits(blk, bit + ib * texel - anc, ib - is_anc);
+            uint h[3];
+            for (uint c = 0u; c < 3u; c++) {
+                int v = bptc_interp(ep[sub * 2u][c], ep[sub * 2u + 1u][c], idx, ib);
+                if (is_signed) h[c] = uint(v < 0 ? (((-v * 31) / 32) | 0x8000) : ((v * 31) / 32)) & 0xffffu;
+                else h[c] = uint((v * 31) / 64) & 0xffffu;
+            }
+            dst[row + x * 2u] = h[0] | (h[1] << 16u);
+            dst[row + x * 2u + 1u] = h[2] | (0x3c00u << 16u);
+        }
+    }
+}
+
+void main() {
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+    uint gz = gl_GlobalInvocationID.z;
+    if (gx >= pc.bx || gy >= pc.by || gz >= pc.layers) return;
+
+    uint bwords = pc.kind <= 2u ? 2u : 4u;
+    uint soff = gz * pc.src_layer_words + gy * pc.src_row_words + gx * bwords;
+    uint wpw = pc.kind <= 2u ? 1u : (pc.kind <= 4u ? 2u : (pc.kind == 7u ? 4u : 8u));
+    uint doff = gz * pc.dst_layer_words + (gy * 4u) * pc.dst_row_words + gx * wpw;
+
+    if (pc.kind <= 2u) {
+        uvec2 blk = uvec2(src[soff], src[soff + 1u]);
+        for (uint y = 0u; y < 4u; y++) {
+            uint b0 = pc.kind == 1u ? bc4_byte_u(blk, y * 4u + 0u) : bc4_byte_s(blk, y * 4u + 0u);
+            uint b1 = pc.kind == 1u ? bc4_byte_u(blk, y * 4u + 1u) : bc4_byte_s(blk, y * 4u + 1u);
+            uint b2 = pc.kind == 1u ? bc4_byte_u(blk, y * 4u + 2u) : bc4_byte_s(blk, y * 4u + 2u);
+            uint b3 = pc.kind == 1u ? bc4_byte_u(blk, y * 4u + 3u) : bc4_byte_s(blk, y * 4u + 3u);
+            dst[doff + y * pc.dst_row_words] = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+        }
+    } else if (pc.kind <= 4u) {
+        uvec2 b_r = uvec2(src[soff], src[soff + 1u]);
+        uvec2 b_g = uvec2(src[soff + 2u], src[soff + 3u]);
+        for (uint y = 0u; y < 4u; y++) {
+            uint row = doff + y * pc.dst_row_words;
+            uint r0 = pc.kind == 3u ? bc4_byte_u(b_r, y * 4u + 0u) : bc4_byte_s(b_r, y * 4u + 0u);
+            uint g0 = pc.kind == 3u ? bc4_byte_u(b_g, y * 4u + 0u) : bc4_byte_s(b_g, y * 4u + 0u);
+            uint r1 = pc.kind == 3u ? bc4_byte_u(b_r, y * 4u + 1u) : bc4_byte_s(b_r, y * 4u + 1u);
+            uint g1 = pc.kind == 3u ? bc4_byte_u(b_g, y * 4u + 1u) : bc4_byte_s(b_g, y * 4u + 1u);
+            uint r2 = pc.kind == 3u ? bc4_byte_u(b_r, y * 4u + 2u) : bc4_byte_s(b_r, y * 4u + 2u);
+            uint g2 = pc.kind == 3u ? bc4_byte_u(b_g, y * 4u + 2u) : bc4_byte_s(b_g, y * 4u + 2u);
+            uint r3 = pc.kind == 3u ? bc4_byte_u(b_r, y * 4u + 3u) : bc4_byte_s(b_r, y * 4u + 3u);
+            uint g3 = pc.kind == 3u ? bc4_byte_u(b_g, y * 4u + 3u) : bc4_byte_s(b_g, y * 4u + 3u);
+            dst[row]      = r0 | (g0 << 8u) | (r1 << 16u) | (g1 << 24u);
+            dst[row + 1u] = r2 | (g2 << 8u) | (r3 << 16u) | (g3 << 24u);
+        }
+    } else if (pc.kind <= 6u) {
+        uvec4 blk = uvec4(src[soff], src[soff + 1u], src[soff + 2u], src[soff + 3u]);
+        decode_bc6h(blk, doff, pc.kind == 5u);
+    } else if (pc.kind == 7u) {
+        uvec4 blk = uvec4(src[soff], src[soff + 1u], src[soff + 2u], src[soff + 3u]);
+        decode_bc7(blk, doff);
+    }
+}

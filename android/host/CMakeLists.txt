@@ -108,6 +108,13 @@ target_compile_options(dav1d PRIVATE -O2 -w -fvisibility=hidden)
 target_compile_definitions(dav1d PRIVATE _GNU_SOURCE)
 
 # One host: target <tgt> with the profile of <game> compiled in. The game profile header, as dm/host/Makefile makes it (game.py header), goes into gen/<game>
+set(BCDEC_COMP ${GFX}/vk_android/selftest/bcdec.comp)
+set(BCDEC_H ${GEN}/vka_bcdec_spv.h)
+add_custom_command(OUTPUT ${BCDEC_H}
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/compile_spv.py ${BCDEC_COMP} ${BCDEC_H} SPV_BCDEC_COMP --ndk "${CMAKE_ANDROID_NDK}"
+  DEPENDS ${BCDEC_COMP} ${CMAKE_CURRENT_SOURCE_DIR}/compile_spv.py
+  COMMENT "SPIR-V compile bcdec.comp")
+
 function(nxhost_add tgt game)
   set(GAME_H ${GEN}/${game}/game_profile.h)
   add_custom_command(OUTPUT ${GAME_H}
@@ -118,11 +125,11 @@ function(nxhost_add tgt game)
   # every build (a seed file added after CMake configured would not be seen by a DEPENDS list); game.py writes the header only when it changes
   set(SEED_H ${GEN}/${game}/vk_prewarm_seed.h)
   add_custom_target(${tgt}_seed COMMAND ${Python3_EXECUTABLE} ${ROOT}/dm/games/game.py seed ${game} ${SEED_H} BYPRODUCTS ${SEED_H} COMMENT "prewarm seed ${game}")
-  add_library(${tgt} SHARED ${HOST_C} ${GFX_C} ${ASM_OUT} ${GAME_H} ${SEED_H})
+  add_library(${tgt} SHARED ${HOST_C} ${GFX_C} ${ASM_OUT} ${GAME_H} ${SEED_H} ${BCDEC_H})
   add_dependencies(${tgt} ${tgt}_seed)
   target_link_libraries(${tgt} PRIVATE peanuts_rt)   # PEANUTS: the companion runtime
   set_target_properties(${tgt} PROPERTIES LINKER_LANGUAGE CXX)   # PEANUTS: link with the C++ driver so libc++ comes in (the host is C)
-  target_include_directories(${tgt} PRIVATE ${GEN}/${game} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST} ${NX_COOP_VENDOR_DIR})
+  target_include_directories(${tgt} PRIVATE ${GEN}/${game} ${GEN} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST} ${NX_COOP_VENDOR_DIR})
   # DM_NUP_ZSTD: compressed files of a NUP container are decompressed with zstddec (dm/host/nup_image.h)
   target_compile_definitions(${tgt} PRIVATE _GNU_SOURCE DM_NUP_ZSTD NX_COOP_VENDOR=${NX_COOP_VENDOR} $<$<BOOL:${NX_LSFG}>:NX_LSFG>)
   # As the Mac host (-O1 -g -Wall -Wno-unused-function). Hidden visibility: the assembly reaches C symbols with adrp, which a shared library allows only for symbols it binds itself
@@ -152,7 +159,7 @@ function(nxhost_add_generic tgt)
     COMMAND ${Python3_EXECUTABLE} ${PROFILE_DIR}/gen_runtime_profile.py schema-stamp ${SCHEMA_H}
     DEPENDS ${PROFILE_DIR}/gen_runtime_profile.py ${ROOT}/dm/games/game.py
     COMMENT "generic host schema stamp")
-  add_library(${tgt} SHARED ${HOST_C} ${GFX_C} ${ASM_OUT} ${PROFILE_DIR}/profile_rt.c ${SCHEMA_H})
+  add_library(${tgt} SHARED ${HOST_C} ${GFX_C} ${ASM_OUT} ${PROFILE_DIR}/profile_rt.c ${SCHEMA_H} ${BCDEC_H})
   target_link_libraries(${tgt} PRIVATE peanuts_rt)
   set_target_properties(${tgt} PROPERTIES LINKER_LANGUAGE CXX)
   target_include_directories(${tgt} PRIVATE ${GEN_INC} ${GEN} ${PROFILE_DIR} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST} ${NX_COOP_VENDOR_DIR})   # (the co-op module, as the per-title hosts)

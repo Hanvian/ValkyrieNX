@@ -5,6 +5,7 @@
 // until the shader side lands. Every transfer op is followed by a full memory barrier: correct, not fast
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_bcn.h"
 #include "../nvn/nvn_mtl.h"
 #include "../nvn/nvn_timestamp.h"
 #include "vka_present_rot.h"
@@ -1015,13 +1016,42 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
     unsigned lv = c->has_view && c->view.set_levels ? c->view.base_level : 0, l0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     vka_tex_soft_copy(im, to_tex ? (int)lv : -1, g_cb);   // (a soft texture copied from, or into at level 0: made whole first)
     if (!vka_img_lv(im, &lv) || c->r.width <= 0 || c->r.height <= 0) return;
-    size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + f->bw - 1) / f->bw) * f->bpb, rows = (size_t)(c->r.height + f->bh - 1) / f->bh;
+    uint32_t sbw = f->bc_dec ? 4u : f->bw, sbh = f->bc_dec ? 4u : f->bh, sbpb = f->bc_dec ? f->src_bpb : f->bpb;
+    size_t bx = ((size_t)c->r.width + sbw - 1) / sbw;
+    size_t row = S.copy_stride ? (size_t)S.copy_stride : bx * sbpb, rows = ((size_t)c->r.height + sbh - 1) / sbh;
     size_t img = S.copy_img_stride ? (size_t)S.copy_img_stride : row * rows;
     int is3d = im->depth > 1 || c->tex->d.target == NVN_TEXTURE_TARGET_3D, nz = c->r.depth > 0 ? c->r.depth : 1;
-    if (row % f->bpb) { VRED_ONCE("buffer copy row stride %zu is not a whole number of %u-byte blocks", row, f->bpb); return; }
-    uint64_t span = img * (size_t)(nz - 1) + row * (rows - 1) + (size_t)((c->r.width + f->bw - 1) / f->bw) * f->bpb;
+    if (row % sbpb) { VRED_ONCE("buffer copy row stride %zu is not a whole number of %u-byte blocks", row, sbpb); return; }
+    uint64_t span = img * (size_t)(nz - 1) + row * (rows - 1) + bx * sbpb;
     VkBuffer b; VkDeviceSize o;
     if (!vka_addr(c->src, span, &b, &o, NULL)) { static _Atomic int nr; if (atomic_fetch_add(&nr, 1) < 8) VRED("%s at %#llx (%llu bytes) is not in placed guest RAM", to_tex ? "buffer → texture copy source" : "texture → buffer copy destination", (unsigned long long)c->src, (unsigned long long)span); return; }
+    if (f->bc_dec) {
+        if (!to_tex) { VRED_ONCE("texture → buffer copy of software-decoded BC%u format %#x is not supported", f->bc_dec, im->d.format); return; }
+        uint32_t dl0 = is3d ? 0 : l0 + (uint32_t)c->r.zoffset;
+        int32_t dz0 = is3d ? c->r.zoffset : 0;
+        if (!vka_bcdec_dispatch(g_cb, b, o, (uint32_t)row, (uint32_t)img, im, lv, dl0, c->r.xoffset, c->r.yoffset, dz0,
+                                (uint32_t)c->r.width, (uint32_t)c->r.height, (uint32_t)nz)) {
+            size_t dpitch = (size_t)c->r.width * f->bpb, dslice = dpitch * (size_t)c->r.height;
+            vka_span ds = {0}; VkDeviceSize dal = f->bpb % 4 == 0 ? f->bpb : f->bpb % 2 == 0 ? 2 * f->bpb : 4 * f->bpb;
+            if (!vka_scratch(dslice * (size_t)nz, dal * 16, &ds)) return;
+            const uint8_t *sp = (const uint8_t *)(uintptr_t)c->src;
+            for (int z = 0; z < nz; z++)
+                vka_bcn_decode(f->bc_dec, (uint32_t)c->r.width, (uint32_t)c->r.height, (uint32_t)bx,
+                               sp + (size_t)z * img, row, ds.ptr + (size_t)z * dslice, dpitch);
+            VkBufferImageCopy drg[64]; int dn = 0;
+            for (int z = 0; z < (is3d ? 1 : nz); z++) {
+                drg[dn++] = (VkBufferImageCopy){ds.off + (is3d ? 0 : (VkDeviceSize)z * dslice), (uint32_t)c->r.width, (uint32_t)c->r.height,
+                                                {asp, lv, is3d ? 0 : l0 + (uint32_t)c->r.zoffset + (uint32_t)z, 1},
+                                                {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset : 0},
+                                                {(uint32_t)c->r.width, (uint32_t)c->r.height, is3d ? (uint32_t)nz : 1}};
+                if (dn == 64 || z + 1 == (is3d ? 1 : nz)) { vk.vkCmdCopyBufferToImage(g_cb, ds.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)dn, drg); dn = 0; }
+            }
+            vka_img_written(im);
+            vka_barrier(g_cb);
+        }
+        g_stat_ops++;
+        return;
+    }
     vka_span s = {0}; VkDeviceSize al = asp == VK_IMAGE_ASPECT_COLOR_BIT ? (f->bpb % 4 == 0 ? f->bpb : f->bpb % 2 == 0 ? 2 * f->bpb : 4 * f->bpb) : 4;   // a whole block and a multiple of 4
     int bounce = o % al != 0 || (img % row) != 0;   // Vulkan wants block-aligned offsets and layers a whole number of rows apart
     if (bounce) {
@@ -1115,6 +1145,14 @@ static void copy_t2t(const p_copy_t2t *c) {
         VkImageResolve r = {ss, {c->sr.xoffset, c->sr.yoffset, 0}, ds, {c->dr.xoffset, c->dr.yoffset, 0}, {(uint32_t)c->sr.width, (uint32_t)c->sr.height, 1}};
         if (sa == VK_IMAGE_ASPECT_COLOR_BIT) vk.vkCmdResolveImage(g_cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
         else VRED_ONCE("depth resolve is not on Vulkan yet");
+    } else if (d->f.bc_dec && s->f.kind == 1 && s->f.bpb == d->f.src_bpb && s->samples == 1 && d->samples == 1
+               && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT))
+               && sa == VK_IMAGE_ASPECT_COLOR_BIT && c->sr.width == (c->dr.width + 3) / 4 && c->sr.height == (c->dr.height + 3) / 4) {
+        vka_bcdec_from_image(g_cb, s, sl, s3 ? 0 : sz0 + (uint32_t)c->sr.zoffset, c->sr.xoffset, c->sr.yoffset, s3 ? c->sr.zoffset : 0,
+                             d, dl, d3 ? 0 : dz0 + (uint32_t)c->dr.zoffset, c->dr.xoffset, c->dr.yoffset, d3 ? c->dr.zoffset : 0,
+                             (uint32_t)c->dr.width, (uint32_t)c->dr.height, (uint32_t)nz);
+        g_stat_ops++;
+        return;
     } else if (c->sr.width == c->dr.width && c->sr.height == c->dr.height && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT))
                && s->samples == d->samples && s->f.bpb == d->f.bpb && s->f.bw == d->f.bw && s->f.bh == d->f.bh
                && ((s->f.vk == d->f.vk && s->f.srgb == d->f.srgb) || sa != VK_IMAGE_ASPECT_COLOR_BIT || (s->f.kind && s->f.kind < 3 && d->f.kind && d->f.kind < 3))) {   // PEANUTS: srgb (see above)

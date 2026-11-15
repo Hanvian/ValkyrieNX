@@ -63,7 +63,7 @@ static int rs_can_locked(vka_img *im) {
     static int pot = -1; if (pot < 0) { const char *e = getenv("DM_RES_SCALE_POT"); pot = e && atoi(e) != 0; }
     uint32_t lim = V.props.limits.maxImageDimension2D;
     if (im->mode != ST_ZERO || im->from_mem || im->track || im->vtrack || im->wt || im->is_video || im->rs || im->vpool || im->soft || im->base) no = 1;   // not GPU content alone
-    else if (d->target != NVN_TEXTURE_TARGET_2D || im->layers != 1 || im->levels != 1 || im->samples != 1 || im->depth != 1 || compressed(&im->f) || im->f.kind == 1 || im->f.kind == 2) no = 1;
+    else if (d->target != NVN_TEXTURE_TARGET_2D || im->layers != 1 || im->levels != 1 || im->samples != 1 || im->depth != 1 || compressed(&im->f) || im->f.bc_dec || im->f.kind == 1 || im->f.kind == 2) no = 1;
     else if (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) no = 1;
     else if (!pot && d->width == d->height && !(d->width & (d->width - 1))) no = 1;                      // a power-of-two square
     else if (vkrs_dim((uint32_t)d->width, vka_rs_q) > lim || vkrs_dim((uint32_t)d->height, vka_rs_q) > lim) no = 1;

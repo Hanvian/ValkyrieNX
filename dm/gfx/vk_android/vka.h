@@ -247,6 +247,7 @@ typedef struct {
     uint8_t kind;          // 0 float / unorm / snorm, 1 uint, 2 sint, 3 depth, 4 stencil, 5 depth-stencil
     uint8_t srgb;          // stored as UNORM, cleared with an sRGB-encoded colour
     uint8_t bpb, bw, bh;
+    uint8_t bc_dec, src_bpb;   // vka_bcn.h software decode kind and compressed block bytes when GPU lacks BC4-7
 } vka_fmt;
 int vka_fmt_of(int nvn_format, vka_fmt *f);         // 0 = no Vulkan format (logged once per format)
 // An image's memory (vka_imgmem.c): space in a shared block (blk, at off, units of 256 bytes) or a dedicated allocation (blk NULL, off 0); size = its memory requirements' size
@@ -372,6 +373,12 @@ void vka_tex_big_stats(char *b, size_t n);           // the largest images the G
 void vka_tex_kind_log(void);                          // log lines: the live images by content and by why the cache keeps them, and the largest (the ctl stats)
 int vka_rp_is_open(void);                            // a render pass is open in the replay's command buffer (vka_draw.c)
 void vka_tex_writeback(VkCommandBuffer cb);   // mtl_sub_commit, after the last pass
+int vka_bcdec_dispatch(VkCommandBuffer cb, VkBuffer src_buf, VkDeviceSize src_off, uint32_t src_row_bytes, uint32_t src_layer_bytes,
+                       vka_img *dst_im, uint32_t dst_lv, uint32_t dst_l0, int32_t xoff, int32_t yoff, int32_t zoff,
+                       uint32_t w, uint32_t h, uint32_t layers);
+void vka_bcdec_from_image(VkCommandBuffer cb, vka_img *src_im, uint32_t slv, uint32_t sl0, int32_t sx0, int32_t sy0, int32_t sz0,
+                          vka_img *dst_im, uint32_t dlv, uint32_t dl0, int32_t dx0, int32_t dy0, int32_t dz0,
+                          uint32_t w_px, uint32_t h_px, uint32_t layers);
 // Texture pool reads (vka_tex.c, DM_VK_POOL_FB): the texture IDs shaders read through the pool, reported by the GPU, so their images are made and kept while read
 // The bitmap, a storage buffer of 2^20 bits, in a set of its own after the pool's: on Qualcomm's driver a storage buffer in the pool's set, after its 2^20 sampled images,
 // is never written (docs/reference/rendering.md "Texture pool reads report nothing on Qualcomm's driver")

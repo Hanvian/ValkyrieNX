@@ -197,7 +197,7 @@ static struct {
     int swrite;                                          // a draw of the pass wrote memory (storage buffers or images, raw global stores, a geometry shader's claim)
     int bar_pending;                                     // a game barrier came inside the pass and was taken there (vka_rp_game_barrier): the draws after it are checked (bar_hazard)
     int rt_cont, dread;                                  // SET_RT continued the pass; a draw of the pass sampled its depth attachment
-    struct { vka_img *im, *sh; uint32_t lv, l0, nl, bw, bh; } bc[8]; int nbc;   // block-compressed targets drawn through their shadows (bcrt_attach), copied back at the pass end
+    struct { vka_img *im, *sh; uint32_t lv, l0, nl, bw, bh, mw, mh; } bc[8]; int nbc;   // block-compressed targets drawn through their shadows (bcrt_attach), copied back at the pass end
     int rsc; float rsf;                                  // PEANUTS: its targets are scaled images (DM_RES_SCALE, vka_rp_rs), and the factor (1.0 when not): viewports and scissors are scaled by it
 } R;
 // Inline uniform updates (OP_UPDATE_UB) that came with a render pass open (DM_VK_UB_DEFER, default 1): Vulkan forbids vkCmdCopyBuffer inside a rendering pass, and ending the
@@ -455,7 +455,7 @@ static void rt_range(const vka_img *im, const view_t *v, int has_v, uint32_t *lv
 // replay's own, one per format, size and layer count), filled from the texture's level (or its layers, or a 3D texture's depth planes) by a copy before the pass and copied
 // back after it (vkCmdCopyImage between size-compatible formats: a texel of one is a block of the other). Only levels whose size is a whole number of blocks; others are
 // not drawn into, as before, logged. DM_VK_BC_RT=0: none (the earlier behaviour)
-static int bc_fmt(const vka_fmt *f) { return f->bw > 1 || f->bh > 1; }   // (vka_tex.c compressed)
+static int bc_fmt(const vka_fmt *f) { return f->bw > 1 || f->bh > 1 || f->bc_dec; }   // (vka_tex.c compressed or decoded BC4-7)
 static struct { int fmt; uint32_t w, h, nl; tex_t t; } g_bcsh[16]; static int g_nbcsh;   // (the recording thread only)
 static vka_img *bcrt_shadow(int fmt, uint32_t w, uint32_t h, uint32_t nl) {
     int k = 0; while (k < g_nbcsh && !(g_bcsh[k].fmt == fmt && g_bcsh[k].w == w && g_bcsh[k].h == h && g_bcsh[k].nl == nl)) k++;
@@ -479,7 +479,8 @@ static VkImageCopy bcrt_region(const vka_img *im, uint32_t lv, uint32_t l0, uint
 }
 // The shadow's view for colour target i of a pass, or VK_NULL_HANDLE (not this case, or it cannot: logged); *f the view's format, *shp the shadow
 static VkImageView bcrt_attach(const p_set_rt *rt, int i, vka_img *im, const vka_fmt *f, uint32_t *w, uint32_t *h, uint32_t *nlo, vka_img **shp) {
-    if (!VKA_ENV("DM_VK_BC_RT", 1) || !(rt->has_cview[i] && rt->cview[i].set_format) || !bc_fmt(&im->f) || f->kind >= 3 || bc_fmt(f) || f->bpb != im->f.bpb) return VK_NULL_HANDLE;
+    uint32_t exp_bpb = im->f.bc_dec ? im->f.src_bpb : im->f.bpb;
+    if (!VKA_ENV("DM_VK_BC_RT", 1) || !(rt->has_cview[i] && rt->cview[i].set_format) || !bc_fmt(&im->f) || f->kind >= 3 || bc_fmt(f) || f->bpb != exp_bpb) return VK_NULL_HANDLE;
     uint32_t lv, l0, nl; rt_range(im, &rt->cview[i], rt->has_cview[i], &lv, &l0, &nl);
     if (lv >= im->levels || !nl || R.nbc == 8) return VK_NULL_HANDLE;
     uint32_t mw = im->w >> lv ? im->w >> lv : 1, mh = im->h >> lv ? im->h >> lv : 1;
@@ -489,15 +490,18 @@ static VkImageView bcrt_attach(const p_set_rt *rt, int i, vka_img *im, const vka
     // BC render-target shadow path cover a game's full mip chain, down to 1x1, matching that padding; general fix, not
     // Peanuts-specific (MK8D's attract-mode race replay regenerates such a chain and went almost entirely black for
     // ~20s with the old all-or-nothing check: issue #6).
-    uint32_t bw = (mw + im->f.bw - 1) / im->f.bw, bh = (mh + im->f.bh - 1) / im->f.bh;
+    uint32_t mbw = im->f.bc_dec ? 4u : im->f.bw, mbh = im->f.bc_dec ? 4u : im->f.bh;
+    uint32_t bw = (mw + mbw - 1) / mbw, bh = (mh + mbh - 1) / mbh;
     vka_img *sh = bcrt_shadow(rt->cview[i].format, bw, bh, nl);
     if (!sh || !(sh->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) { VRED_ONCE("block-compressed render target: no shadow image of NVN format %#x: not drawn into", rt->cview[i].format); return VK_NULL_HANDLE; }
     vka_tex_own(im, g_cb); vka_tex_own(sh, g_cb);
     VkImageView v = vka_view(sh, f->view, nl > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, nl, NULL);
     if (!v) return VK_NULL_HANDLE;
-    VkImageCopy rc = bcrt_region(im, lv, l0, nl, bw, bh, 0);   // what the texture holds, for a pass that loads it or covers only part of it
-    vka_barrier(g_cb); vk.vkCmdCopyImage(g_cb, im->img, VK_IMAGE_LAYOUT_GENERAL, sh->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rc); vka_barrier(g_cb);
-    R.bc[R.nbc].im = im; R.bc[R.nbc].sh = sh; R.bc[R.nbc].lv = lv; R.bc[R.nbc].l0 = l0; R.bc[R.nbc].nl = nl; R.bc[R.nbc].bw = bw; R.bc[R.nbc++].bh = bh;
+    if (!im->f.bc_dec) {
+        VkImageCopy rc = bcrt_region(im, lv, l0, nl, bw, bh, 0);   // what the texture holds, for a pass that loads it or covers only part of it
+        vka_barrier(g_cb); vk.vkCmdCopyImage(g_cb, im->img, VK_IMAGE_LAYOUT_GENERAL, sh->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rc); vka_barrier(g_cb);
+    }
+    R.bc[R.nbc].im = im; R.bc[R.nbc].sh = sh; R.bc[R.nbc].lv = lv; R.bc[R.nbc].l0 = l0; R.bc[R.nbc].nl = nl; R.bc[R.nbc].bw = bw; R.bc[R.nbc].mw = mw; R.bc[R.nbc].mh = mh; R.bc[R.nbc++].bh = bh;
     static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("block-compressed render target: texture serial %llu (NVN format %#x, %ux%u level %u, layers or planes %u+%u) drawn through a %ux%u shadow in NVN format %#x",
         (unsigned long long)im->serial, im->d.format, mw, mh, lv, l0, nl, bw, bh, rt->cview[i].format);
     *w = bw; *h = bh; *nlo = nl; *shp = sh;
@@ -506,9 +510,15 @@ static VkImageView bcrt_attach(const p_set_rt *rt, int i, vka_img *im, const vka
 static void bcrt_flush(void) {   // the shadows' blocks into their textures (after the pass's barrier)
     if (!R.nbc) return;
     for (int k = 0; k < R.nbc; k++) {
-        VkImageCopy rc = bcrt_region(R.bc[k].im, R.bc[k].lv, R.bc[k].l0, R.bc[k].nl, R.bc[k].bw, R.bc[k].bh, 1);
-        vk.vkCmdCopyImage(g_cb, R.bc[k].sh->img, VK_IMAGE_LAYOUT_GENERAL, R.bc[k].im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rc);
-        vka_img_written(R.bc[k].im);
+        if (R.bc[k].im->f.bc_dec) {
+            vka_bcdec_from_image(g_cb, R.bc[k].sh, 0, 0, 0, 0, 0,
+                                 R.bc[k].im, R.bc[k].lv, R.bc[k].l0, 0, 0, (int32_t)R.bc[k].l0,
+                                 R.bc[k].mw, R.bc[k].mh, R.bc[k].nl);
+        } else {
+            VkImageCopy rc = bcrt_region(R.bc[k].im, R.bc[k].lv, R.bc[k].l0, R.bc[k].nl, R.bc[k].bw, R.bc[k].bh, 1);
+            vk.vkCmdCopyImage(g_cb, R.bc[k].sh->img, VK_IMAGE_LAYOUT_GENERAL, R.bc[k].im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rc);
+            vka_img_written(R.bc[k].im);
+        }
     }
     R.nbc = 0; vka_barrier(g_cb);
 }
@@ -585,7 +595,7 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const p_scissor *sc, int has
         const tex_t *t = rt->color[i]; if (!t) continue;
         vka_img *im = vka_tex_get(t, g_cb); vka_fmt f;
         if (!im || !vka_fmt_of(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : t->d.format, &f)) continue;
-        if (!(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || f.kind >= 3) {
+        if (!(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || f.kind >= 3 || im->f.bc_dec) {
             uint32_t bw, bh, bnl; vka_img *sh = NULL; VkImageView bv = f.kind < 3 ? bcrt_attach(rt, i, im, &f, &bw, &bh, &bnl, &sh) : VK_NULL_HANDLE;
             if (bv) {   // a block-compressed texture drawn into through an uncompressed view: its shadow (bcrt_attach)
                 ca[i].imageView = bv; R.cf[i] = f.view; R.ckind[i] = f.kind; samples = 1; fb_im[nfb] = sh; fb_lv[nfb++] = 0; s_im[i] = sh; s_lv[i] = 0; s_nl[i] = bnl;

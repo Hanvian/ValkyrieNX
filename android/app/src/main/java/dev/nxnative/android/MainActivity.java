@@ -177,7 +177,8 @@ public final class MainActivity extends Activity {
 
     private void buildHome(LinearLayout content) {
         overlayRow = null;
-        content.addView(Ui.header(this, Ui.badge(this, 44), "Peanuts Native", Prefs.buildId(), Ui.iconButton(this, R.drawable.ic_settings, "Settings", Ui.Kind.TONAL, v -> page(true))));   // the build identifier under the title (Prefs.buildId, the part of the overlay's build tag after the app's name), so a screenshot of Home names its build; Settings › About has the full tag   // PEANUTS: rebrand
+        String appTitle = Profile.all().size() == 1 ? getString(R.string.app_name) : "Peanuts Native";
+        content.addView(Ui.header(this, Ui.badge(this, 44), appTitle, Prefs.buildId(), Ui.iconButton(this, R.drawable.ic_settings, "Settings", Ui.Kind.TONAL, v -> page(true))));   // the build identifier under the title (Prefs.buildId, the part of the overlay's build tag after the app's name), so a screenshot of Home names its build; Settings › About has the full tag   // PEANUTS: rebrand
         accessCard = accessCard();
         Ui.add(content, accessCard, 16);
         Ondevice.attach(this, content, content.getChildCount());   // a game being prepared and its progress (hidden when there is none)
@@ -283,7 +284,7 @@ public final class MainActivity extends Activity {
 
         Ui.add(content, Ui.section(this, "System"), Ui.SECTION_GAP);
         LinearLayout sys = settingsCard(content);
-        gpuRow = new Ui.Setting(this, "🎮", "GPU driver", v -> GpuDriver.dialog(this, PICK_DRIVER)).chevron(this);   // custom GPU drivers (GpuDriver.java)
+        gpuRow = new Ui.Setting(this, "🎮", "GPU driver", v -> openGpuDriver()).chevron(this);   // custom GPU drivers (GpuDriver.java)
         sys.addView(gpuRow.view);
         sys.addView(new Ui.Setting(this, "📁", "Folders", v -> Folders.dialog(this)).value("Game, pack and save folders").chevron(this).view);
         sys.addView(new Ui.Setting(this, "🧹", "Storage", v -> StorageUi.dialog(this)).value("Remove leftovers and old files; never saves").chevron(this).view);   // (StorageUi.java)
@@ -349,7 +350,32 @@ public final class MainActivity extends Activity {
         drsRow.value(Prefs.DRS_NAMES[Prefs.drs(this)]);
         lsfgRow.value(!BuildConfig.NX_LSFG ? "Not in this build" : Lsfg.on(this) ? "On · " + Lsfg.multiplier(this) + "x" + (Lsfg.find(this) == null ? " · Lossless.dll missing" : "") : "Off");
         GpuDriver.Info d = GpuDriver.selected(this);
-        gpuRow.value(d == null ? "System" : d.label());
+        gpuRow.value(d == null ? systemDriverLabel() : d.label());
+    }
+
+    private boolean isSystemOnlyGpu() {
+        java.util.Map<String, String> f = Prefs.facts(this, Recommend.SYSTEM);
+        return !f.isEmpty() && !Readiness.customDriversFit(f);
+    }
+
+    private String systemDriverLabel() {
+        if (!isSystemOnlyGpu()) return "System";
+        String name = GpuGl.name();
+        return name != null && !name.isEmpty() ? "System (" + name + ")" : "System (built-in Vulkan)";
+    }
+
+    private void openGpuDriver() {
+        if (GpuDriver.selected(this) == null && isSystemOnlyGpu()) {
+            String gpu = GpuGl.name();
+            String msg = (gpu != null && !gpu.isEmpty() ? gpu : "This GPU") + " runs directly on the device's built-in system Vulkan driver. "
+                    + "Custom Adreno/Turnip GPU drivers are not required or compatible here.";
+            new PadFocus.Builder(this).setTitle("GPU driver").setMessage(msg)
+                    .setPositiveButton("Keep System", null)
+                    .setNeutralButton("Advanced…", (d, w) -> GpuDriver.dialog(this, PICK_DRIVER))
+                    .show();
+            return;
+        }
+        GpuDriver.dialog(this, PICK_DRIVER);
     }
 
     @Override public void onWindowFocusChanged(boolean focus) {
