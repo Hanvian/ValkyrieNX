@@ -893,7 +893,7 @@ static void *present_main(void *arg) {
         for (int g = 0; g < ng; g++) { pq_item gi = it; gi.src = gen[g]; gi.has_crop = 0; gi.ticket = 0; gi.fence = 0; gi.hold = hold; vka_fps_note(present_one(&gi), 1); }
         it.hold = ng ? hold : game_period;
         int shown = present_one(&it);
-        if (shown) { extern _Atomic uint64_t dm_present_ns; __atomic_store_n(&dm_present_ns, now_ns(), __ATOMIC_RELAXED); dm_guest_frame_tick(); if (peanuts_tick) peanuts_tick(); }   // PEANUTS: the companion's per-frame tick (dm/peanuts)
+        if (shown) { extern uint64_t dm_present_ns; __atomic_store_n(&dm_present_ns, now_ns(), __ATOMIC_RELAXED); dm_guest_frame_tick(); if (peanuts_tick) peanuts_tick(); }   // PEANUTS: the companion's per-frame tick (dm/peanuts)
         if (!shown || !V.display_timing) pres_note(it.ticket, shown ? now_ns() / 1e9 : -1);
         vka_fps_note(shown, 0);
         pthread_mutex_lock(&g_pmu);
