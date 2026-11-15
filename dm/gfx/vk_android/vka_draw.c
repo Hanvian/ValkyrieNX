@@ -2914,12 +2914,12 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
 
 int vka_rp_must_draw(void) {
     if (!R.on) return 0;
-    if (R.nbcrt > 0 || (R.full_w && R.full_w <= 256) || (R.full_h && R.full_h <= 256)) return 1;
+    if (R.nbc > 0 || R.swrite || (R.full_w && R.full_w <= 256) || (R.full_h && R.full_h <= 256)) return 1;
     for (int i = 0; i < R.nci; i++) {
         vka_img *im = R.cim[i];
         if (!im) continue;
         if (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 1;
-        if (im->d.w <= 256 || im->d.h <= 256) return 1;
+        if (im->w <= 256 || im->h <= 256) return 1;
         if (im->d.target == NVN_TEXTURE_TARGET_3D || im->d.target == NVN_TEXTURE_TARGET_CUBEMAP || im->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) return 1;
     }
     return 0;
