@@ -432,6 +432,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     push(&j);
     return j.ticket;
 }
+void vka_pso_builds_log(void);
 void vka_present_hitch_log(void);
 void vka_hitch_dump(void) {
     vka_pso_builds_log();
