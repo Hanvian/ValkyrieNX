@@ -35,6 +35,7 @@
 typedef struct {
     int k, step;              // vsyncs each frame stays on screen; the step handed to the game for the next frame (k, or k + 1 while paying back)
     int kmin;                 // the last call's kmin (a lower one takes effect at once)
+    uint32_t late_hist;       // last 32 frames, one bit each (1 = late): persistent lateness at kmin >= 2 is overload, not a hitch, so it is not paid back
     double debt;              // real time the game is behind, in vsyncs
     int late_run, fit_run, trial;   // late frames in a row; frames in a row whose cost fits k − 1; frames left of a trial at k − 1 (0 = none)
     int probe, grace;         // 1: the trial in progress is a probe; 2: a probe held and its run at kmin has not ended yet; frames left of the probe's grace
@@ -115,6 +116,8 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     else if ((slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
         s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0;
     }
+    s->late_hist = (s->late_hist << 1) | (late ? 1u : 0u);
+    if (kmin >= 2 && __builtin_popcount(s->late_hist) >= 8) { s->dropped += s->debt > 0 ? s->debt : 0; s->debt = 0; }   // sustained overload: slow the game a little instead of bursts of a longer step
     s->step = s->k + (s->debt >= 1 && s->k < FSTEP_MAX);
     s->paid += s->step > s->k;
     return s->step;
