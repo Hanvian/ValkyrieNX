@@ -249,7 +249,8 @@ static _Atomic uint32_t g_tgen, *g_tver, *g_sver;   // the recording thread's vi
 static smap_ent *map_get(uint64_t s) { return vksm_get(&g_smap, s); }
 static void map_put(uint64_t s, vka_img *im) { vksm_put(&g_smap, s, im); }   // (no memory for a new key: the texture has no entry, so its next lookup makes its image again; the old image goes when its refs do)
 static void map_del(uint64_t s) { if (vksm_del(&g_smap, s)) atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); }   // a tombstone (never a valid serial)
-static void map_del_im(vka_img *im) { if (im && vksm_del_im(&g_smap, im)) atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); }
+static int g_map_batch;   // (under g_tmu) vka_tex_prune_locked removes the map entries of all its images in one pass, so map_del_im has nothing to scan for
+static void map_del_im(vka_img *im) { if (im && !g_map_batch && vksm_del_im(&g_smap, im)) atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); }
 static int cpuw_take(uint64_t s, int add) {   // add: insert; else: remove and say whether it was there
     if (add) { vksm_put(&g_cpuw, s, NULL); return 0; }
     return vksm_del(&g_cpuw, s);
@@ -1722,12 +1723,20 @@ static void img_first_use(vka_img *im, const tex_t *t, VkCommandBuffer cb, int m
     if (cb) vka_barrier(cb);
 }
 
-static void img_evict_locked(vka_img *im) {
-    if (!im) return;
-    redirty_ids(im);
-    map_del_im(im);
-    im->refs = 1;
-    unref_locked(im);
+// The images in v[0..n) let go together (caller holds g_tmu; each marked evicting by the caller). One pass over the registered texture IDs writes again the ones that name them,
+// one over the serial map drops their entries, then each is released: evicting one at a time scanned both tables per image (hundreds of images, a freeze of up to a second)
+static void img_evict_batch_locked(vka_img **v, int n) {
+    if (n <= 0) return;
+    for (int id = 1; id < g_ntreg; id++) {
+        if (!g_treg[id].t.serial) continue;
+        smap_ent *e = map_get(g_treg[id].t.serial);
+        if (e && e->im && e->im->evicting) dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id);
+    }
+    for (size_t i = 0; i < g_smap.cap; i++) { smap_ent *e = &g_smap.e[i]; if (e->serial && e->serial != VKSM_TOMB && e->im && e->im->evicting) vksm_del_ent(&g_smap, e); }
+    atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release);
+    g_map_batch = 1;
+    for (int k = 0; k < n; k++) { v[k]->evicting = 0; v[k]->refs = 1; unref_locked(v[k]); }
+    g_map_batch = 0;
 }
 // The texture cache's limit (vka_texlimit.h): measured from the device every 60 frames (15 under memory pressure), or DM_VK_IMG_LIMIT_MB. Images over it are evicted least recently
 // used first, never one used in this frame or the last; a working set larger than the limit stays (logged), as uploading it again every frame costs far more than the memory
@@ -1837,13 +1846,18 @@ static void vka_tex_prune_locked(void) {
             c[nc++] = (prune_ent){im, im->last_frame, im->gpu_owned != 0};
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
-    uint64_t target = vktl_target(limit_bytes), bytes_freed = 0; int pruned = 0;
-    for (int k = 0; k < nc && total_bytes > target; k++) {
-        uint64_t before = g_img_bytes + vka_imem_zbytes();
-        img_evict_locked(c[k].im);
-        uint64_t after = g_img_bytes + vka_imem_zbytes(), b = before > after ? before - after : 0;
-        pruned++; bytes_freed += b; total_bytes = after;
+    uint64_t target = vktl_target(limit_bytes), bytes_freed = 0, before = total_bytes, est = total_bytes; int pruned = 0;
+    static vka_img **vv; static int vvcap;
+    if (vvcap < ccap) { vvcap = ccap; vv = realloc(vv, (size_t)vvcap * sizeof *vv); }
+    if (!vv) return;
+    for (int k = 0; k < nc && est > target; k++) {   // (chosen by the image's own size; the bytes freed are measured after the batch: a zero-shared allocation goes with its image too)
+        vka_img *im = c[k].im;
+        im->evicting = 1; vv[pruned++] = im;
+        est = est > im->bytes ? est - im->bytes : 0;
     }
+    img_evict_batch_locked(vv, pruned);
+    total_bytes = g_img_bytes + vka_imem_zbytes();
+    bytes_freed = before > total_bytes ? before - total_bytes : 0;
     if (pruned) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 128)

@@ -56,7 +56,7 @@ static int linger_keep(img *im) {
     return 1;
 }
 static void rw_cancel(img *im) { for (int k = 0; k < nRW;) if (RW[k] == im) RW[k] = RW[--nRW]; else k++; im->rw_pend = 0; }
-static void force(img *im) { map_del_im(im); im->refs = 1; unref(im); }   // img_evict_locked, vka_tex_drop_pool: given up whatever its count
+static void force(img *im) { map_del_im(im); im->refs = 1; unref(im); }   // img_evict_batch_locked, vka_tex_drop_pool: given up whatever its count
 static void prune(void) {
     if (g_nlive < 6) return;   // (over the limit)
     for (int i = 0; i < g_nlive;) {
