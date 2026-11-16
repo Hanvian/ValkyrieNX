@@ -334,7 +334,7 @@ static void lock_find(void) {
 // presenting at a cap the game does not step by runs a fixed-step game fast or slow (Tears of the Kingdom 1.4.2 at 2x with DM_FPS_TARGET=60)
 // A floor or a step count does not fix the rate on its own terms: the game still sets its present interval (at or above the floor; the step count, which at a cap below 60 is the cap's)
 static int floor_only(void) { for (int r = 0; r < nrow; r++) if (!follows_game(rows[r]->kind)) return 0; return nrow > 0 && !nier && !fb.n; }
-int dm_fps_lock_engine(void) { pthread_once(&g_found, lock_find); return (nrow || nier || fb.n) && !floor_only(); }
+int dm_fps_lock_engine(void) { pthread_once(&g_found, lock_find); return (nrow || nier || fb.n || dm_fps_state) && !floor_only(); }
 int dm_fps_lock_floor(void) { pthread_once(&g_found, lock_find); for (int r = 0; r < nrow; r++) if (follows_game(rows[r]->kind)) return 1; return 0; }   // the game picks its interval at or above a floor the host writes, or by the step count it writes
 static int steps_row(void) { pthread_once(&g_found, lock_find); for (int r = 0; r < nrow; r++) if (rows[r]->kind == STEPS_I32) return 1; return 0; }
 // The cap: DM_FPS_TARGET or the profile's fps_target at start, then whatever the front end sets while the game runs (dm_fps_target_set: the Android launcher's in-game panel,
@@ -384,7 +384,7 @@ static int row_holds(const lock_t *L, int t) {
     return !mx || 60 / t <= mx;
 }
 static int holds(int t) {
-    int ok = (nier && 60 % t == 0) || fb.n;
+    int ok = (nier && 60 % t == 0) || fb.n || (dm_fps_state && (t == 30 || t == 60));
     for (int r = 0; r < nrow && !ok; r++) ok = row_holds(rows[r], t);
     return ok;
 }

@@ -172,7 +172,7 @@ final class GameSettings {
             picture.add(new Ui.Setting(a, "🔳", "Aspect ratio", v -> aspect(a, g, again)).value(aspectLabel(a, id)).chevron(a));
 
         // ---- Speed ----
-        if (!Prefs.limited(id) && Prefs.ownRate(a, id)) {   // the host found no limiter it can hold for this game: choices would do nothing (the host's frame limiter holds a limited game)
+        if (!Prefs.limited(id) && !Prefs.steps(id) && Prefs.ownRate(a, id)) {   // the host found no limiter it can hold for this game: choices would do nothing (the host's frame limiter holds a limited game)
             Ui.Setting fixed = speed.add(new Ui.Setting(a, "⏱️", "Frame rate cap", null).value("This game picks its own frame rate"));
             fixed.view.setClickable(false);
             fixed.view.setAlpha(0.6f);

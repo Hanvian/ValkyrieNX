@@ -20,10 +20,9 @@ pad_layout	full
 # ---- Graphics ----
 # The frame-interval controller (60 fps cuts in patches.py) and dynamic resolution read the GPU time between the frame's two timestamp reports: each report takes its segment's GPU start / end
 gpu_timestamps	segment
-# 60 fps (30 on the Switch): the host decides each frame's step in whole vsyncs and holds the frame that long (rewriter stubs at setWaitVsyncInterval and VFR::updateInterval,
-# patches.py FRAME_STEP); 30 when 60 does not hold, game time = real time. DM_FPS_TARGET=30 (Documents/env.txt on the iPhone) saves power; 0 runs the game's own
-# interval controller (with the 60 fps cuts, which also serve while the game's VFR override is set)
-fps_target	60
+# 30 fps (as on the Switch): the host decides each frame's step in whole vsyncs and holds the frame that long (rewriter stubs at setWaitVsyncInterval and VFR::updateInterval,
+# patches.py FRAME_STEP); 30 fps target saves power and ensures steady performance in open world; 0 runs the game's own interval controller.
+fps_target	30
 # Tested defaults for this game (iPhone 17 Pro Max, iOS 27.0.1, docked, 60 fps target; GitHub issues #142 / #159): present snapshots keep the GPU from idling between frames,
 # which iOS's clock governor reads as headroom (30 fps without them, a steady 60 for 300 s with them and the encode thread); render pipelines through MTL4Compiler give the
 # pipeline archive, the prepare step and the hybrid pipelines on the iPhone too (5,100 prewarm lines prepared in 0.28 s at start instead of compiling on first use)
@@ -55,3 +54,5 @@ shader_note	Breath of the Wild shaders
 # ---- Recommended settings ----
 # Samsung Xclipse GPUs (gpu.vendor=0x144d) run directly on the system Vulkan driver via opaque_fd mmap and compute BCn decode (dm/games/README.md "Recommended settings").
 recommend	gpu.vendor=0x144d	driver=system
+# Samsung Xclipse GPUs target steady 30 fps cap and SGSR 1 upscaler (dm/games/README.md "Recommended settings").
+recommend	gpu.vendor=0x144d	fps_cap=30 upscaler=sgsr1

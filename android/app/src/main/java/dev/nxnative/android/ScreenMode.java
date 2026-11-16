@@ -27,10 +27,11 @@ final class ScreenMode {
     private static final Map<String, String> NOTES = Map.of(
             "0100000000010000", "Handheld turns off this game's motion moves.",
             "010055D009F78000", "Docked is 1080p and runs below 60 fps on some devices.",
-            "01006BB00C6F0000", "Docked is 1080p and dips below 60 fps on some devices.");
+            "01006BB00C6F0000", "Docked is 1080p and dips below 60 fps on some devices.",
+            "01007EF00011E000", "Docked is 900p; handheld is 720p and maintains a steady 30 fps on Exynos/Xclipse.");
 
-    /** Handheld by default here although the profile says docked: Link's Awakening's 1920x1080 frame took the Thor's GPU 15 ms at the 90th percentile and play dipped to 50 fps; handheld holds 60 */
-    private static final Set<String> PREFER_HANDHELD = Set.of("01006BB00C6F0000");
+    /** Handheld by default here although the profile says docked: Link's Awakening and BotW on mobile GPUs */
+    private static final Set<String> PREFER_HANDHELD = Set.of("01006BB00C6F0000", "01007EF00011E000");
 
     /** The mode the host starts the game in without a line (its profile's op_mode) */
     static int profile(String id) { return HANDHELD.contains(id) ? 1 : 0; }

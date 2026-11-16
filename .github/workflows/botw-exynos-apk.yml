@@ -93,8 +93,8 @@ jobs:
             -PnxPackageId=dev.nxnative.botwexynos.peanuts \
             -PnxGames=01007EF00011E000 \
             -PnxLabel="The Legends Of Zelda: BoTW" \
-            -PnxVersion=0.1.1-exynos-v5 \
-            -PnxVersionCode=5
+            -PnxVersion=0.1.1-exynos-v6 \
+            -PnxVersionCode=6
           ls -lh out/
 
       - name: Upload BotW Exynos APK

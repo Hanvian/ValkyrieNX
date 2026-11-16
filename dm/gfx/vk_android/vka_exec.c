@@ -588,7 +588,7 @@ void vka_rp_sub_begin(void) {
 // 600; 0 = one part) of the part in progress, the part is ended and submitted without a signal, and the submission goes on in the slot's next command buffer. The parts run
 // in order on the one queue, and the barriers recorded in a part cover what later parts do (submission order); only the last part signals the submission's fence.
 // On the Adreno 840 phone, Donkey Kong Bananza's level recorded ~45 ms a frame before its GPU work (~30 ms) began, and the game waited for that frame's fence (@sync_ms ~64)
-typedef struct { VkCommandBuffer cb; uint32_t q; uint64_t gate; } part_arg;   // q: the part's bottom (part_submit) or top (part_begin) timestamp query, UINT32_MAX = none; gate: see g_gate_next
+typedef struct { VkCommandBuffer cb; uint32_t q; uint64_t gate; int is_first; } part_arg;   // q: the part's bottom (part_submit) or top (part_begin) timestamp query, UINT32_MAX = none; gate: see g_gate_next; is_first: 1 for first part of submission
 // A gate (vka_qsched.h "Waits for the CPU", vka_dev.c "Gates"): the replay's next submission to the queue waits for this value of the gate semaphore (0: none)
 static uint64_t g_gate_next;
 static uint64_t gate_take(void) { uint64_t g = g_gate_next; g_gate_next = 0; return g; }
@@ -597,7 +597,7 @@ static void part_submit(const void *a) {   // the part ends and goes to the queu
     if (pa.q != UINT32_MAX) qf.write(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qp, pa.q);
     VkResult r = vk.vkEndCommandBuffer(cb);
     VkSemaphore gs = vka_gate_sem(); VkPipelineStageFlags gst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    if (!r) vka_mem_sync_gpu_reads();
+    if (!r && (pa.is_first || VKA_ENV("DM_VK_MEM_SYNC_ALL_PARTS", 0))) vka_mem_sync_gpu_reads();
     if (!r) r = vka_submit(cb, 0, pa.gate && gs ? 1 : 0, &gs, &pa.gate, &gst, VK_NULL_HANDLE);
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("part of a submission: %d", r); vka_qtrace(QT_SUBMIT_ERR, 0, 0, 0, (uint32_t)r, 0, 0, 0, NULL); }
 }
@@ -635,7 +635,7 @@ static void chunk(void) {
     VkCommandBuffer next = g_slot[k].x[g_nx++];
     // The part's bottom and the next part's top timestamps (the slot's queries were reset at the submission's start, in its first part)
     uint32_t part = g_slot_parts[k]; int ts = g_slot_ts[k] && part < NCHUNK + 1;
-    part_arg pe = {g_cb, ts ? k * QPS + 2 * (part - 1) + 1 : UINT32_MAX, gate_take()}, pb = {next, ts ? k * QPS + 2 * part : UINT32_MAX, 0};
+    part_arg pe = {g_cb, ts ? k * QPS + 2 * (part - 1) + 1 : UINT32_MAX, gate_take(), g_nx == 1}, pb = {next, ts ? k * QPS + 2 * part : UINT32_MAX, 0, 0};
     if (ts) g_slot_parts[k] = part + 1;
     if (VKA_ENV("DM_VK_PARTLOG", 0)) { char zb[400]; vka_rp_zstats(zb, sizeof zb);
         VLOG("part %u of the submission of frame %llu ended at %.3f s: %llu draws%s", part, (unsigned long long)g_frame, now_ns() / 1e9, (unsigned long long)(g_stat_draws - g_chunk_d0), zb); }
@@ -745,7 +745,7 @@ static uint64_t sub_commit(uint64_t reserved, int has_sig, uint64_t signal) {
     uint64_t tc1 = now_ns(); g_t_cm_up += tc1 - tc0;
     unsigned ks = (g_slot_i - 1) % NSLOT;
     if (!signal && !g_slot[ks].vf) { VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; if (vk.vkCreateFence(V.dev, &fi, NULL, &g_slot[ks].vf)) g_slot[ks].vf = VK_NULL_HANDLE; }
-    if (!r) vka_mem_sync_gpu_reads();
+    if (!r && (!g_nx || VKA_ENV("DM_VK_MEM_SYNC_ALL_PARTS", 0))) vka_mem_sync_gpu_reads();
     if (!r) r = vka_submit_fence(g_cb, signal, !signal ? g_slot[ks].vf : VK_NULL_HANDLE, gate_take());
     if (!r && !signal && g_slot[ks].vf) g_slot[ks].vf_on = 1;   // (no fence made: the slot waits for the timeline, as a signalled one)
     g_t_cm_sub += now_ns() - tc1;
