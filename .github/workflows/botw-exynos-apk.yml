@@ -68,7 +68,7 @@ jobs:
             echo "::endgroup::"
           done
           sh peanuts/scripts/check-runtime-profile.sh
-          clang -O1 -Wall -Werror -o /tmp/t_fstep dm/gfx/tests/t_fstep.c && /tmp/t_fstep
+          clang -O1 -Wall -Werror -o /tmp/t_fstep dm/gfx/tests/t_fstep.c -lm && /tmp/t_fstep
 
       - name: Build on-device packer stage (arm64-v8a)
         run: |
