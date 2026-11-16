@@ -77,6 +77,12 @@ jobs:
             dm/peanuts/pack_worker/build.sh
           zsh peanuts/scripts/ondevice-stage.sh /tmp/botw-stage
 
+      - name: Restore or create persistent debug keystore cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: botw-exynos-debug-keystore-v1
+
       - name: Build single-game BotW Exynos APK
         run: |
           cd android/app
@@ -87,8 +93,8 @@ jobs:
             -PnxPackageId=dev.nxnative.botwexynos.peanuts \
             -PnxGames=01007EF00011E000 \
             -PnxLabel="The Legends Of Zelda: BoTW" \
-            -PnxVersion=0.1.1-exynos-v3 \
-            -PnxVersionCode=3
+            -PnxVersion=0.1.1-exynos-v4 \
+            -PnxVersionCode=4
           ls -lh out/
 
       - name: Upload BotW Exynos APK

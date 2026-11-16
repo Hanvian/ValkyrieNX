@@ -452,6 +452,10 @@ typedef struct {   // what one dump line needs, copied under G so that a thread 
     int have, npc, guest;   // have: the registers were read; guest: pc is in a guest module
     uint64_t x[10], pc[24];   // x0-x2, x19-x25; the pc, the lr and the frame-pointer chain
 } hitch_t;
+#if defined(__ANDROID__)
+__attribute__((weak)) void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);
+__attribute__((weak)) void nvn_dirty_mp_fail(uint64_t *fails, int *err);
+#endif
 // Holding G (thr_free and the exit flag need it, so no thread in the list is freed or leaves meanwhile). Between the suspend and the resume only mach calls and memory reads
 // run: no malloc, no stdio, no dladdr (the suspended thread may hold their locks). The symbols are looked up after every thread runs again
 static void hitch_grab(thr_t *t, hitch_t *h) {
@@ -495,6 +499,115 @@ static void hitch_log(const hitch_t *h) {
         kinds[h->wkind], (unsigned long long)h->waddr, (unsigned long long)h->wkey, h->sleeping ? " sleeping" : "", h->host_work ? " host-work" : "", h->rs, h->svc, m ? m->name : "?",
         (unsigned long long)(m ? h->lr - (uint64_t)m->base : h->lr), w);
 }
+#if defined(__ANDROID__)
+static void hitch_fmt_addr(uint64_t a, char *out, size_t n) {
+    module_t *m = module_of((void *)a); Dl_info di;
+    if (m) snprintf(out, n, "%s+%#llx", m->name, (unsigned long long)(a - (uint64_t)m->base));
+    else if (a && dladdr((void *)a, &di) && di.dli_sname) snprintf(out, n, "%s", di.dli_sname);
+    else snprintf(out, n, "%#llx", (unsigned long long)a);
+}
+static int hitch_sample_one(uint32_t handle, uint64_t *pc, uint64_t *lr, uint64_t x[3], uint64_t *sp,
+                            int64_t *cpu_us, int *rs) {
+    int ok = 0;
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (t->handle != handle || !t->started || t->exited || !t->mport) continue;
+        *rs = plat_thread_run_state(t->mport);
+        *cpu_us = plat_thread_cpu_us(t->mport);
+        if (!plat_thread_suspend(t->mport)) {
+            plat_regs_t st;
+            if (!plat_thread_get_regs(t->mport, &st)) {
+                *pc = st.pc; *lr = st.lr; x[0] = st.x[0]; x[1] = st.x[1]; x[2] = st.x[2]; *sp = st.sp; ok = 1;
+            }
+            plat_thread_resume(t->mport);
+        }
+        break;
+    }
+    pthread_mutex_unlock(&G);
+    return ok;
+}
+// Detailed diagnostics for running guest threads during a hitch: distinguishes a tight CPU loop from a repeated fault retry without locking/malloc inside thread suspend.
+static void hitch_probe_active(const hitch_t *hs, int nt) {
+    for (int k = 0; k < nt; k++) {
+        const hitch_t *h = &hs[k];
+        if (!h->have || h->rs != 1 || !h->guest) continue;
+        uint64_t pc0 = h->pc[0], lr0 = h->pc[1], x0 = h->x[0], x20 = h->x[4];
+        uint64_t rstart = 0, rsize = 0; int rprot = 0;
+        if (!plat_mem_region(pc0, &rstart, &rsize, &rprot))
+            LOG("  hitch probe %#x pc map: %#llx+%#llx prot=%#x", h->handle, (unsigned long long)rstart, (unsigned long long)rsize, rprot);
+        if (x0 && !plat_mem_region(x0, &rstart, &rsize, &rprot))
+            LOG("  hitch probe %#x x0 map: %#llx+%#llx prot=%#x", h->handle, (unsigned long long)rstart, (unsigned long long)rsize, rprot);
+        if (x20 && x20 != x0 && !plat_mem_region(x20, &rstart, &rsize, &rprot))
+            LOG("  hitch probe %#x x20 map: %#llx+%#llx prot=%#x", h->handle, (unsigned long long)rstart, (unsigned long long)rsize, rprot);
+
+        uint32_t code[24] = {0}, lri = 0, tgt_code[8] = {0}; uint64_t tgt = 0;
+        int have_code = !plat_mem_read((pc0 & ~3ull) - 48, code, sizeof code);
+        int have_lri = lr0 >= 4 && !plat_mem_read(lr0 - 4, &lri, 4);
+        int have_tgt = 0;
+        if (have_lri && (lri & 0xFC000000u) == 0x94000000u) {
+            uint64_t imm26 = lri & 0x03FFFFFFu;
+            uint64_t off26 = (imm26 & 0x02000000u ? imm26 | ~0x03FFFFFFULL : imm26) << 2;
+            tgt = (lr0 - 4) + off26;
+            have_tgt = !plat_mem_read(tgt, tgt_code, sizeof tgt_code);
+        }
+        uint32_t x0d[8] = {0}; int have_x0 = x0 && !plat_mem_read(x0, x0d, sizeof x0d);
+        if (have_code) {
+            char cb[512]; size_t q = 0; cb[0] = 0;
+            for (int i = 0; i < 24 && q < sizeof cb - 16; i++)
+                q += (size_t)snprintf(cb + q, sizeof cb - q, "%s%08x", i == 12 ? " [" : (i == 13 ? "] " : (i ? " " : "")), code[i]);
+            LOG("  hitch probe %#x code [pc-0x30..pc+0x2c]: %s", h->handle, cb);
+        }
+        if (have_lri) {
+            char tb[96] = "-";
+            if (tgt) hitch_fmt_addr(tgt, tb, sizeof tb);
+            LOG("  hitch probe %#x lr-4=%08x tgt=%s words=[%08x %08x %08x %08x %08x %08x %08x %08x] (have=%d)",
+                h->handle, lri, tb, tgt_code[0], tgt_code[1], tgt_code[2], tgt_code[3], tgt_code[4], tgt_code[5], tgt_code[6], tgt_code[7], have_tgt);
+            if (have_tgt && (tgt_code[0] & 0x9F000000u) == 0x90000000u && (tgt_code[1] & 0xFFC00000u) == 0xF9400000u &&
+                (tgt_code[0] & 31u) == ((tgt_code[1] >> 5) & 31u)) {
+                uint64_t imm21 = (((uint64_t)(tgt_code[0] >> 5) & 0x7FFFFu) << 2) | ((tgt_code[0] >> 29) & 3u);
+                uint64_t pg_off = (imm21 & 0x100000u ? imm21 | ~0x1FFFFFULL : imm21) << 12;
+                uint64_t page = (tgt & ~0xFFFULL) + pg_off;
+                uint64_t uoff = ((tgt_code[1] >> 10) & 0xFFFull) << 3, val = 0;
+                uint32_t vcode[4] = {0};
+                if (!plat_mem_read(page + uoff, &val, 8)) {
+                    char gb[96]; hitch_fmt_addr(val, gb, sizeof gb);
+                    (void)plat_mem_read(val, vcode, sizeof vcode);
+                    LOG("  hitch probe %#x plt->%s (%#llx) [%08x %08x %08x %08x]",
+                        h->handle, gb, (unsigned long long)val, vcode[0], vcode[1], vcode[2], vcode[3]);
+                }
+            }
+        }
+        if (have_x0)
+            LOG("  hitch probe %#x *x0: %08x %08x %08x %08x %08x %08x %08x %08x",
+                h->handle, x0d[0], x0d[1], x0d[2], x0d[3], x0d[4], x0d[5], x0d[6], x0d[7]);
+
+        uint64_t fa0 = 0, pr0 = 0, fa1 = 0, pr1 = 0, mpf0 = 0, mpf1 = 0; int mpe0 = 0, mpe1 = 0;
+        if (nvn_dirty_stats) nvn_dirty_stats(&fa0, &pr0);
+        if (nvn_dirty_mp_fail) nvn_dirty_mp_fail(&mpf0, &mpe0);
+        int64_t cpu0 = -1, cpu1 = -1; int rs0 = -1, rs1 = -1;
+        uint64_t sp_pc = 0, sp_lr = 0, sp_x[3] = {0}, sp_sp = 0;
+        (void)hitch_sample_one(h->handle, &sp_pc, &sp_lr, sp_x, &sp_sp, &cpu0, &rs0);
+        char sbuf[1024]; size_t sq = 0; sbuf[0] = 0;
+        for (int s = 0; s < 5 && sq < sizeof sbuf - 128; s++) {
+            struct timespec d = {0, 10000000}; nanosleep(&d, NULL);
+            uint64_t spc = 0, slr = 0, sx[3] = {0}, ssp = 0; int srs = -1; int64_t scpu = -1;
+            int sok = hitch_sample_one(h->handle, &spc, &slr, sx, &ssp, &scpu, &srs);
+            if (s == 4) { cpu1 = scpu; rs1 = srs; }
+            if (sok) {
+                char pb[64], lb[64]; hitch_fmt_addr(spc, pb, sizeof pb); hitch_fmt_addr(slr, lb, sizeof lb);
+                sq += (size_t)snprintf(sbuf + sq, sizeof sbuf - sq, " [%d:st=%d %s lr=%s x0=%#llx x1=%#llx x2=%#llx]",
+                                       s + 1, srs, pb, lb, (unsigned long long)sx[0], (unsigned long long)sx[1], (unsigned long long)sx[2]);
+            } else sq += (size_t)snprintf(sbuf + sq, sizeof sbuf - sq, " [%d:none]", s + 1);
+        }
+        if (nvn_dirty_stats) nvn_dirty_stats(&fa1, &pr1);
+        if (nvn_dirty_mp_fail) nvn_dirty_mp_fail(&mpf1, &mpe1);
+        LOG("  hitch probe %#x 50ms: cpu=%lld us (st %d->%d) dirty_faults=+%llu(%llu) preps=+%llu(%llu) mp_fail=%llu(err=%d)%s",
+            h->handle, (long long)(cpu0 >= 0 && cpu1 >= cpu0 ? cpu1 - cpu0 : -1), rs0, rs1,
+            (unsigned long long)(fa1 - fa0), (unsigned long long)fa1, (unsigned long long)(pr1 - pr0), (unsigned long long)pr1,
+            (unsigned long long)mpf1, mpe1, sbuf);
+    }
+}
+#endif
 static void *hitch_main(void *arg) {
     plat_thread_set_name("dm hitch dump");
     const char *e = arg; uint64_t lim = (uint64_t)atoi(e) * 1000000ull, seen = 0, skip = 0; int n = 0;
@@ -513,6 +626,9 @@ static void *hitch_main(void *arg) {
         int nt = 0;
         pthread_mutex_lock(&G); for (thr_t *t = g_all; t && nt < 256; t = t->all) if (t->started && !t->exited) hitch_grab(t, &hs[nt++]); pthread_mutex_unlock(&G);
         for (int k = 0; k < nt; k++) hitch_log(&hs[k]);
+#if defined(__ANDROID__)
+        hitch_probe_active(hs, nt);
+#endif
     }
     return NULL;
 }
