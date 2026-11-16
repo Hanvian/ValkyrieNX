@@ -3162,6 +3162,50 @@ vka_img *vka_tex_id_img(int id, VkCommandBuffer cb) {   // the image of texture 
     nvn_pool_use(1); vka_img *im = treg_dead(id, &e) ? NULL : vka_tex_get(&e.t, cb); nvn_pool_use(0);
     return im;
 }
+int vka_tex_id_info(int id, VkCommandBuffer cb, vka_img **im, uint32_t *lv, uint32_t *nlv, uint32_t *l0, uint32_t *nl) {
+    pthread_mutex_lock(&g_tmu);
+    if (id <= 0 || id >= g_ntreg || !g_treg[id].t.serial) { pthread_mutex_unlock(&g_tmu); return 0; }
+    treg_ent e = g_treg[id];
+    pthread_mutex_unlock(&g_tmu);
+    nvn_pool_use(1); vka_img *m = treg_dead(id, &e) ? NULL : vka_tex_get(&e.t, cb); nvn_pool_use(0);
+    if (!m) return 0;
+    uint32_t base_lv = e.has_v && e.v.set_levels ? e.v.base_level : 0, lv_img = base_lv;
+    if (!vka_img_lv(m, &lv_img)) return 0;
+    uint32_t all_lv = e.t.d.levels ? e.t.d.levels : 1;
+    uint32_t nlv_v = e.has_v && e.v.set_levels && e.v.nlevels ? e.v.nlevels : (base_lv < all_lv ? all_lv - base_lv : 1);
+    if (lv_img + nlv_v > m->levels) nlv_v = m->levels - lv_img;
+    if (!nlv_v) return 0;
+    uint32_t a0 = e.has_v && e.v.set_layers ? e.v.min_layer : 0, all_a = vka_img_slices(m, lv_img);
+    uint32_t na = e.has_v && e.v.set_layers && e.v.nlayers ? e.v.nlayers : (a0 < all_a ? all_a - a0 : 0);
+    if (a0 + na > all_a) na = a0 < all_a ? all_a - a0 : 0;
+    if (!na) return 0;
+    if (im) *im = m; if (lv) *lv = lv_img; if (nlv) *nlv = nlv_v; if (l0) *l0 = a0; if (nl) *nl = na;
+    return 1;
+}
+VkImageView vka_tex_id_fb_view(int id, vka_img *snap, uint8_t dim) {
+    if (!snap) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_tmu);
+    if (id <= 0 || id >= g_ntreg || !g_treg[id].t.serial) { pthread_mutex_unlock(&g_tmu); return VK_NULL_HANDLE; }
+    treg_ent e = g_treg[id];
+    pthread_mutex_unlock(&g_tmu);
+    if (treg_dead(id, &e)) return VK_NULL_HANDLE;
+    int vt = dim_view_type(dim);
+    if (vt < 0 || (((dim & DMSH_VK_DIM_MS) != 0) != (snap->samples > 1))) return VK_NULL_HANDLE;
+    vka_fmt vf = view_fmt(&e, snap);
+    int want = dim & DMSH_VK_DIM_SINT ? 2 : dim & DMSH_VK_DIM_UINT ? 1 : 0, have = vf.kind == 1 ? 1 : vf.kind == 2 ? 2 : 0;
+    VkFormat ovr = VK_FORMAT_UNDEFINED;
+    if (want != have && !(vf.kind >= 3 && want == 0)) {
+        ovr = class_twin(vf.vk, want);
+        if (!ovr || vf.kind > 2) return VK_NULL_HANDLE;
+    }
+    treg_ent es = e;
+    if (!es.has_v) { memset(&es.v, 0, sizeof es.v); es.has_v = 1; }
+    es.v.set_levels = 1; es.v.base_level = 0; es.v.nlevels = 1;
+    t_view_strict = ovr != VK_FORMAT_UNDEFINED;
+    VkImageView vw = view_of(&es, snap, vt, 0, ovr);
+    t_view_strict = 0;
+    return vw;
+}
 // DM_VK_NANSCAN_DUMP: level 0 of texture ID id as its storage holds it now (deswizzled), written to DM_TEMP as nan-now-<serial>.blk
 void vka_tex_id_dump(int id) {
     pthread_mutex_lock(&g_tmu);

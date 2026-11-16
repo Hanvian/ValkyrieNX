@@ -68,7 +68,9 @@ jobs:
             echo "::endgroup::"
           done
           sh peanuts/scripts/check-runtime-profile.sh
+          mkdir -p dm/host/tests/build
           clang -O1 -Wall -Werror -o /tmp/t_fstep dm/gfx/tests/t_fstep.c -lm && /tmp/t_fstep
+          clang -O1 -g -Wall -Werror -Wno-unused-function -I dm/host/tests -DGAMES_DIR="\"$(pwd)/dm/games\"" -o dm/host/tests/build/t_android_pwlist dm/host/tests/t_android_pwlist.c && dm/host/tests/build/t_android_pwlist
 
       - name: Build on-device packer stage (arm64-v8a)
         run: |
@@ -81,28 +83,43 @@ jobs:
       - name: Restore or create persistent debug keystore cache
         uses: actions/cache@v4
         with:
-          path: ~/.android/debug.keystore
-          key: botw-exynos-debug-keystore-v1
+          path: /home/runner/.android/debug.keystore
+          key: botw-exynos-debug-keystore-v2
+
+      - name: Ensure persistent debug keystore exists before Gradle
+        run: |
+          mkdir -p /home/runner/.android
+          if [ ! -f /home/runner/.android/debug.keystore ]; then
+            keytool -genkeypair -v -keystore /home/runner/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          ls -la /home/runner/.android/debug.keystore
 
       - name: Build single-game BotW Exynos APK
+        env:
+          ANDROID_USER_HOME: /home/runner/.android
         run: |
           cd android/app
           chmod +x gradlew
-          for attempt in 1 2; do
+          for attempt in 1 2 3; do
             if ./gradlew --no-daemon apk \
               -PnxPackStage=/tmp/botw-stage/stage \
               -PnxApp=peanuts \
               -PnxPackageId=dev.nxnative.botwexynos.peanuts \
               -PnxGames=01007EF00011E000 \
               -PnxLabel="The Legends Of Zelda: BoTW" \
-              -PnxVersion=0.1.1-exynos-v7 \
-              -PnxVersionCode=7; then
+              -PnxVersion=0.1.1-exynos-v8 \
+              -PnxVersionCode=8; then
               break
             fi
-            [ "$attempt" -eq 2 ] && exit 1
-            sleep 15
+            [ "$attempt" -eq 3 ] && exit 1
+            sleep $((attempt * 15))
           done
           ls -lh out/
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -n1)
+          if [ -n "$APKSIGNER" ]; then "$APKSIGNER" verify --print-certs out/*.apk; fi
 
       - name: Upload BotW Exynos APK
         uses: actions/upload-artifact@v4

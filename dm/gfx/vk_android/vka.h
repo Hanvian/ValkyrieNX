@@ -441,6 +441,8 @@ int vka_tex_id_pending(int id);                     // texture ID id is register
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout);   // the same on the recording thread, through a memo (DM_VK_TEX_MEMO)
 VkFormat vka_tex_id_vkfmt(int id);   // the format texture ID id is viewed in, not its (possibly shared) image's (vka_tex.c)
 VkImageView vka_tex_id_view_bits(int id, VkCommandBuffer cb, VkImageLayout *layout);   // a storage view of its image as R32_UINT (4-byte texels), not written into the bindless table (vka_tex.c)
+int vka_tex_id_info(int id, VkCommandBuffer cb, vka_img **im, uint32_t *lv, uint32_t *nlv, uint32_t *l0, uint32_t *nl);
+VkImageView vka_tex_id_fb_view(int id, vka_img *snap, uint8_t dim);
 int vka_tex_id_pending_rec(int id, uint8_t dim);
 int vka_tex_id_storage_pending(int id);            // texture ID id's image exists without storage use and would be remade with it at its next storage binding (a draw ends its pass first)
 int vka_tex_id_tbuf(int id, int want, int storage, uint64_t *addr, uint64_t *bytes, VkFormat *fmt, uint32_t *texel);   // PEANUTS: a buffer texture's elements as a texel buffer: guest address, bytes, view format (vka_tex.c)
@@ -576,6 +578,7 @@ int vka_rp_depth(uint32_t *w, uint32_t *h);   // the open pass has a depth / ste
 void vka_rp_zstats(char *b, size_t n);   // DM_VK_PARTLOG: the depth state of the part's draws into depth targets, then reset (vka_draw.c)
 void vka_rp_note_ts(void);                 // a timestamp recorded (inside the open pass or not: counted when one is open)
 int vka_rp_game_barrier(uint32_t bits);                // a game barrier (OP_BARRIER): 1 = taken inside the open pass (DM_VK_BAR_KEEP), 0 = the caller ends the pass and records a full barrier
+void vka_draw_fb_barrier(void);                        // invalidates same-pass feedback snapshots on an explicit barrier
 void vka_rp_bar_stats(char *b, size_t n, double frames);
 void vka_rp_prep_clear(const p_set_rt *rt, int has_rt); // before a clear of these targets: a pass or pending clears of other targets end
 // A clear of a bound target: everything the clear outside a pass needs (vka_clear_outside, vka_exec.c), and the value for the attachment inside one

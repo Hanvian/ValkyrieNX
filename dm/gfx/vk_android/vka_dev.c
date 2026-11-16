@@ -1018,17 +1018,16 @@ static _Atomic uint64_t g_fspan[FSPAN], g_fspan_f[FSPAN];   // per frame (mod FS
 static uint64_t g_floor_frames[5];                            // frames at each step (statistics)
 static double g_p90_sum; static uint64_t g_p90_n;
 // The period the floor aims at, for every floor (the queue hint's DM_VK_GPU_FLOOR_AUTO=1 and the ADPF floor's reports, vka_perf.c): the game's shortest period, the shortest
-// present period it has asked for in this session and at most one 60 Hz vsync (16.7 ms), not the period it presents at now. A game with a dynamic present interval decides
-// its interval from how long its frames take: DKB's controller (main+0x204a18) steps from 3 vsyncs (20 fps) back to 2 only when its measure of the frame is below 20 ms. At
-// 20 fps the GPU idles a third of the time, its governor lowers the clock, the frame's GPU time grows to 33-36 ms (Adreno 840) and the game stays at 20 fps for good; a floor
-// aiming at the current period (50 ms, or the 33.3 ms cap the auto floor had) sees that frame on target and never raises the clock. Aiming at the shortest period keeps the
-// clock where the game can step back up. DM_VK_GPU_FLOOR_PERIOD=<ms> (live; default 0 = the shortest period) sets it instead (33.3: the cap before 2026-11-05)
+// present period it has asked for in this session and at most one 30 Hz interval (33.3 ms, or 16.7 ms before any present / for 60fps games that temporarily drop to 20-30 fps).
+// Clamping a native 30fps game to 16.7 ms makes ADPF report 30 ms frames as ~2x over budget every frame and drives sustained thermal throttling on mid-range SoCs.
+// DM_VK_GPU_FLOOR_PERIOD=<ms> (live; default 0 = the shortest period) overrides it directly.
 _Atomic int64_t vka_period_min_ns;   // the shortest present period the game asked for (vka_perf.c vka_perf_frame); 0 = none yet
 int64_t vka_floor_period_ns(void) {
     double ms = VKA_ENVF("DM_VK_GPU_FLOOR_PERIOD", 0.0);
     if (ms >= 4 && ms <= 200) return (int64_t)(ms * 1e6);
-    int64_t m = atomic_load_explicit(&vka_period_min_ns, memory_order_relaxed), v = 16666667;
-    return m >= 4000000 && m < v ? m : v;
+    int64_t m = atomic_load_explicit(&vka_period_min_ns, memory_order_relaxed);
+    if (m < 4000000) return 16666667;
+    return m < 33333333 ? m : 33333333;
 }
 void vka_floor_span(uint64_t frame, uint64_t ns) {           // the completion thread: a submission of frame ended ns after the frame began
     unsigned k = frame % FSPAN;

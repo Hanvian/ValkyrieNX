@@ -150,9 +150,11 @@ static VkDescriptorPool g_dp[NSLOT][MAXPOOLS]; static int g_ndp[NSLOT], g_cur_dp
 void vka_dyn_invalidate(void);
 static void drv_memo_reset(void);
 static void rp_miss_reset(void);   // g_miss_n, below: a submission's draws start the render-area miss count again
+static void fb_reset(void);
 void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_cb = cb; g_slot = slot % NSLOT; vka_dyn_invalidate();
     rp_miss_reset();
+    fb_reset();
     { void vka_mem_rec_thread(void); vka_mem_rec_thread(); }   // the address lookups' cache outside TLS for the recording thread (vka_mem.c)
     drv_memo_reset();   // the last submission's scratch spans go with its fence
     g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
@@ -192,6 +194,7 @@ static struct {
     int on, classic; VkRect2D area; uint32_t full_w, full_h, layers, samples; int area_cut;   // classic: begun as a VkRenderPass (DM_VK_CLASSIC_RP); area_cut: area narrowed by DM_VK_RP_AREA
     uint32_t ncolor; VkFormat cf[8]; uint8_t ckind[8]; VkFormat df, sf;
     vka_img *cim[8]; uint32_t clv[8], cl0[8]; int nci;   // the colour attachments (DM_VK_NANSCAN)
+    vka_img *rt_im[8]; uint32_t rt_lv[8], rt_l0[8];      // per-slot colour image/level/layer for same-pass feedback detection
     p_set_rt rt; int has_rt;                             // the targets it was opened for: a later SET_RT of the same targets keeps it open
     uint32_t cnl[8], dnl; VkExtent2D cext[8], dext;      // each attachment's layers and level size (clears in the pass must cover what they would outside it)
     int swrite;                                          // a draw of the pass wrote memory (storage buffers or images, raw global stores, a geometry shader's claim)
@@ -200,6 +203,80 @@ static struct {
     struct { vka_img *im, *sh; uint32_t lv, l0, nl, bw, bh, mw, mh; } bc[8]; int nbc;   // block-compressed targets drawn through their shadows (bcrt_attach), copied back at the pass end
     int rsc; float rsf;                                  // PEANUTS: its targets are scaled images (DM_RES_SCALE, vka_rp_rs), and the factor (1.0 when not): viewports and scissors are scaled by it
 } R;
+
+// Earliest colour slot in r that names the same (serial, base_level, min_layer) subresource as slot i; -1 if empty.
+static int rt_first_slot(const p_set_rt *r, int i) {
+    if (!r || i < 0 || i >= r->n || i >= 8 || !r->color[i]) return -1;
+    uint32_t lv = r->has_cview[i] && r->cview[i].set_levels ? r->cview[i].base_level : 0;
+    uint32_t ly = r->has_cview[i] && r->cview[i].set_layers ? r->cview[i].min_layer : 0;
+    for (int j = 0; j < i; j++) if (r->color[j] && r->color[j]->serial == r->color[i]->serial) {
+        uint32_t jlv = r->has_cview[j] && r->cview[j].set_levels ? r->cview[j].base_level : 0;
+        uint32_t jly = r->has_cview[j] && r->cview[j].set_layers ? r->cview[j].min_layer : 0;
+        if (jlv == lv && jly == ly) return j;
+    }
+    return i;
+}
+static int rt_dup_slot(const p_set_rt *r, int i) { int f = rt_first_slot(r, i); return f >= 0 && f < i; }
+
+// Same-pass colour attachment feedback snapshots (DM_VK_FB_SNAP): if a shader samples a texture subresource attached as a colour
+// target of its own pass (e.g. BotW G-buffer / decal draws), copy it once outside the pass into a pooled snapshot image and bind
+// that snapshot in stage_writes until the pass closes or an explicit OP_BARRIER / whole clear invalidates it.
+enum { FB_SNAP_CAP = 16, FB_POOL_CAP = 32 };
+static struct { int fmt, target, samples; uint32_t w, h, layers; int busy; tex_t t; } g_fb_pool[FB_POOL_CAP];
+static int g_nfb_pool;
+static struct { vka_img *src, *snap; uint32_t lv, l0, nl; int pool_idx; } g_fb[FB_SNAP_CAP];
+static int g_nfb;
+
+static void fb_reset(void) {
+    for (int i = 0; i < g_nfb; i++) {
+        int idx = g_fb[i].pool_idx;
+        if (idx >= 0 && idx < FB_POOL_CAP) g_fb_pool[idx].busy = 0;
+    }
+    g_nfb = 0;
+}
+void vka_draw_fb_barrier(void) { fb_reset(); }
+
+static vka_img *fb_find(vka_img *im, uint32_t lv, uint32_t l0, uint32_t nl) {
+    for (int i = 0; i < g_nfb; i++)
+        if (g_fb[i].src == im && g_fb[i].lv == lv && g_fb[i].l0 <= l0 && l0 + nl <= g_fb[i].l0 + g_fb[i].nl)
+            return g_fb[i].snap;
+    return NULL;
+}
+static vka_img *fb_alloc_snap(vka_img *src, uint32_t lv, int *idx_out) {
+    uint32_t pw = src->w >> lv ? src->w >> lv : 1, ph = src->h >> lv ? src->h >> lv : 1;
+    uint32_t pl = src->d.target == NVN_TEXTURE_TARGET_3D ? (src->depth >> lv ? src->depth >> lv : 1) : src->layers;
+    int fmt = src->d.format, tgt = src->d.target, smp = (int)src->samples, k = -1;
+    for (int i = 0; i < g_nfb_pool; i++) {
+        if (!g_fb_pool[i].busy && g_fb_pool[i].fmt == fmt && g_fb_pool[i].target == tgt && g_fb_pool[i].samples == smp
+            && g_fb_pool[i].w == pw && g_fb_pool[i].h == ph && g_fb_pool[i].layers == pl) { k = i; break; }
+    }
+    if (k < 0) {
+        if (g_nfb_pool < FB_POOL_CAP) k = g_nfb_pool++;
+        else { for (int i = 0; i < g_nfb_pool; i++) if (!g_fb_pool[i].busy) { k = i; break; } }
+        if (k < 0) return NULL;
+        tex_t *t = &g_fb_pool[k].t; memset(t, 0, sizeof *t);
+        t->d.target = tgt; t->d.width = pw; t->d.height = ph; t->d.depth = pl; t->d.levels = 1;
+        t->d.format = fmt; t->d.samples = smp;
+        t->serial = 0xFB00000000000000ull + (uint64_t)(k + 1) + ((uint64_t)g_nfb_pool << 16);
+        g_fb_pool[k].fmt = fmt; g_fb_pool[k].target = tgt; g_fb_pool[k].samples = smp;
+        g_fb_pool[k].w = pw; g_fb_pool[k].h = ph; g_fb_pool[k].layers = pl;
+    }
+    vka_img *snap = vka_tex_get(&g_fb_pool[k].t, g_cb);
+    if (!snap) return NULL;
+    g_fb_pool[k].busy = 1;
+    vka_tex_own(snap, g_cb);
+    *idx_out = k;
+    return snap;
+}
+static VkImageView fb_view(int tid, uint8_t dim, VkImageLayout *lay) {
+    vka_img *im = NULL; uint32_t lv = 0, nlv = 0, l0 = 0, nl = 0;
+    if (!g_nfb || !vka_tex_id_info(tid, g_cb, &im, &lv, &nlv, &l0, &nl) || nlv != 1) return VK_NULL_HANDLE;
+    vka_img *snap = fb_find(im, lv, l0, nl);
+    if (!snap) return VK_NULL_HANDLE;
+    VkImageView v = vka_tex_id_fb_view(tid, snap, dim);
+    if (v && lay) *lay = VK_IMAGE_LAYOUT_GENERAL;
+    return v;
+}
 // Inline uniform updates (OP_UPDATE_UB) that came with a render pass open (DM_VK_UB_DEFER, default 1): Vulkan forbids vkCmdCopyBuffer inside a rendering pass, and ending the
 // pass for each update split Splatoon Raiders' 6400x6400 ink-map occlusion-query pass 150-1,550 times a frame (7 inline updates per query). While R.on is open, the updates are
 // recorded in g_gw at once (vka_tex_gw_update) and coalesced here: draws in the pass whose uniform buffers overlap UB bind a scratch shadow reconstructed by vka_tex_gw_read, a
@@ -445,7 +522,7 @@ void vka_rp_end(void) {
     vka_xp_ts(g_cb, 1);
     bcrt_flush();        // block-compressed targets drawn through shadows: their blocks back (bcrt_attach)
     ub_flush();          // inline uniform updates deferred during the pass: copied into placed guest RAM
-    R.on = 0; vka_tex_feedback(NULL, NULL, 0);
+    R.on = 0; vka_tex_feedback(NULL, NULL, 0); fb_reset();
     if (vka_nan_on()) vka_nan_pass(g_cb, R.cim, R.clv, R.cl0, R.nci);
 }
 static void rt_peek(const char *what, int i, const tex_t *t, const vka_img *im, uint32_t lv, uint32_t l0, uint32_t nl);   // DM_VK_TEX_PEEK
@@ -501,6 +578,10 @@ static VkImageView bcrt_attach(const p_set_rt *rt, int i, vka_img *im, const vka
     if (!im->f.bc_dec) {
         VkImageCopy rc = bcrt_region(im, lv, l0, nl, bw, bh, 0);   // what the texture holds, for a pass that loads it or covers only part of it
         vka_barrier(g_cb); vk.vkCmdCopyImage(g_cb, im->img, VK_IMAGE_LAYOUT_GENERAL, sh->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rc); vka_barrier(g_cb);
+    } else {
+        VkClearColorValue zero; memset(&zero, 0, sizeof zero);
+        VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, nl};
+        vka_barrier(g_cb); vk.vkCmdClearColorImage(g_cb, sh->img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg); vka_barrier(g_cb);
     }
     R.bc[R.nbc].im = im; R.bc[R.nbc].sh = sh; R.bc[R.nbc].lv = lv; R.bc[R.nbc].l0 = l0; R.bc[R.nbc].nl = nl; R.bc[R.nbc].bw = bw; R.bc[R.nbc].mw = mw; R.bc[R.nbc].mh = mh; R.bc[R.nbc++].bh = bh;
     static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("block-compressed render target: texture serial %llu (NVN format %#x, %ux%u level %u, layers or planes %u+%u) drawn through a %ux%u shadow in NVN format %#x",
@@ -590,10 +671,11 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const p_scissor *sc, int has
     if (has_rt) R.rt = *rt; R.has_rt = has_rt;
     R.rsc = rs; R.rsf = rs ? vka_rs_q / 4.0f : 1.0f;   // PEANUTS: (DM_RES_SCALE)
     int n = has_rt ? (rt->n < 8 ? rt->n : 8) : 0;
+    for (int i = 0; i < 8; i++) R.rt_im[i] = NULL;
     for (int i = 0; i < n; i++) {
         ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
         R.cf[i] = VK_FORMAT_UNDEFINED;
-        const tex_t *t = rt->color[i]; if (!t) continue;
+        const tex_t *t = rt->color[i]; if (!t || rt_dup_slot(rt, i)) continue;
         vka_img *im = vka_tex_get(t, g_cb); vka_fmt f;
         if (!im || !vka_fmt_of(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : t->d.format, &f)) continue;
         if (!(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || f.kind >= 3 || im->f.bc_dec) {
@@ -614,6 +696,7 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const p_scissor *sc, int has
         VkImageView v = vka_view(im, f.view, nl > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, l0, nl, NULL);
         if (!v) continue;
         ca[i].imageView = v; R.cf[i] = f.view; R.ckind[i] = f.kind; samples = im->samples; fb_im[nfb] = im; fb_lv[nfb++] = lv; s_im[i] = im; s_lv[i] = lv; s_nl[i] = nl;
+        R.rt_im[i] = im; R.rt_lv[i] = lv; R.rt_l0[i] = l0;
         R.cim[R.nci] = im; R.clv[R.nci] = lv; R.cl0[R.nci++] = l0;
         rt_peek("colour", i, t, im, lv, l0, nl);
         uint32_t lw = im->w >> lv ? im->w >> lv : 1, lh = im->h >> lv ? im->h >> lv : 1;
@@ -663,14 +746,16 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const p_scissor *sc, int has
     int nlate = 0; vka_pclear *late[NPC];
     sa = da;
     for (int k = 0; k < PC.n; k++) {
-        vka_pclear *c = &PC.c[k]; int ci = c->ci;
-        int att = ci >= 0 ? ci < n && ca[ci].imageView && R.cnl[ci] == layers && R.cnl[ci] == c->nl
-                          : R.dnl == layers && R.dnl == c->nl && (!(c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) || dp) && (!(c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) || sp);
-        VkExtent2D e = ci >= 0 ? (ci < 8 ? R.cext[ci] : (VkExtent2D){0, 0}) : R.dext;
+        vka_pclear *c = &PC.c[k];
+        int orig_ci = c->ci, ci = orig_ci >= 0 && has_rt ? rt_first_slot(rt, orig_ci) : orig_ci;
+        if (orig_ci >= 0 && ci >= 0) c->ci = ci;
+        int att = orig_ci >= 0 ? ci >= 0 && ci < n && ca[ci].imageView && R.cnl[ci] == layers && R.cnl[ci] == c->nl
+                               : R.dnl == layers && R.dnl == c->nl && (!(c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) || dp) && (!(c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) || sp);
+        VkExtent2D e = orig_ci >= 0 ? (ci >= 0 && ci < 8 ? R.cext[ci] : (VkExtent2D){0, 0}) : R.dext;
         int whole = att && !c->rc.offset.x && !c->rc.offset.y && c->rc.extent.width == w && c->rc.extent.height == h && e.width == w && e.height == h;
         int inarea = att && (uint32_t)c->rc.offset.x + c->rc.extent.width <= w && (uint32_t)c->rc.offset.y + c->rc.extent.height <= h;
         if (whole && !nlate) {   // (after a late one it would come first: late too)
-            if (ci >= 0) { ca[ci].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[ci].clearValue = c->in; }
+            if (orig_ci >= 0) { ca[ci].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[ci].clearValue = c->in; }
             else { if (c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) { da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da.clearValue.depthStencil.depth = c->in.depthStencil.depth; }
                    if (c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) { sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; sa.clearValue.depthStencil.stencil = c->in.depthStencil.stencil; } }
         } else if (inarea) late[nlate++] = c;
@@ -799,11 +884,14 @@ int vka_rp_clear(const p_set_rt *rt, int has_rt, const vka_dstate *d, const vka_
         PC.c[PC.n++] = *c;
         return 1;
     }
-    int ci = c->ci; uint32_t nl = c->nl; VkRect2D rc = c->rc;
+    int ci = c->ci >= 0 && R.has_rt ? rt_first_slot(&R.rt, c->ci) : c->ci;
+    if (c->ci >= 0 && ci < 0) return 0;
+    uint32_t nl = c->nl; VkRect2D rc = c->rc;
     if (ci >= 0 ? ci >= 8 || !R.cf[ci] || R.cnl[ci] != nl || nl != R.layers : ((c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) && !R.df) || ((c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) && !R.sf) || R.dnl != nl || nl != R.layers) return 0;
     if ((uint32_t)rc.offset.x + rc.extent.width > R.area.extent.width || (uint32_t)rc.offset.y + rc.extent.height > R.area.extent.height) return 0;
     VkClearAttachment ca = {c->asp, ci >= 0 ? (uint32_t)ci : 0, c->in}; VkClearRect cr = {rc, 0, nl};
     vka_oq_pass_end();   // a clear adds no samples on NVN: outside any occlusion query (the next draw begins another)
+    if (ci >= 0 && g_nfb) fb_reset();
     vk.vkCmdClearAttachments(g_cb, 1, &ca, 1, &cr);
     if (c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) { g_zs.ncl++; if (g_zlog_pass && zlog_room()) VLOG("zlog depth clear inside pass %llu: %.6f at %d,%d %ux%u", (unsigned long long)vka_n_rp, c->in.depthStencil.depth, rc.offset.x, rc.offset.y, rc.extent.width, rc.extent.height); }
     return 1;
@@ -1541,7 +1629,8 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
             if (r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
                 int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0;
-                if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
+                if (tid && r[i].what == VKA_R_TEX && R.on && g_nfb) v = fb_view(tid, r[i].dim, &lay);
+                if (tid && !v) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
                 if (tid && v) class_note(sh, st, &r[i], tid, storage);
                 if (tid) tex_peek(sh->key, st, &r[i], v, storage);
                 if (tid && g_rtl_pass && rtl_room()) {   // PEANUTS: DM_VK_RT_LOG: each draw's textures, in order with its draw lines (the tex peek line is logged once per texture)
@@ -2183,6 +2272,91 @@ static int bisect_drop(vka_shader *const *sh) {
     return 1;
 }
 
+// Same-pass colour attachment feedback (DM_VK_FB_SNAP): if graphics stages sample a texture subresource also attached as a
+// colour target of this pass (either already open in R or about to open from rt), snapshot each such target once outside the
+// pass so draws read the snapshot while writing to the attachment.
+static void fb_prepare(const p_set_rt *rt, int has_rt) {
+    if (!g_cb || !VKA_ENV("DM_VK_FB_SNAP", 1)) return;
+    if (!R.on && g_nfb) fb_reset();
+    int nc = R.on ? (int)(R.ncolor < 8 ? R.ncolor : 8) : (has_rt && rt ? (rt->n < 8 ? rt->n : 8) : 0);
+    if (nc <= 0) return;
+    int any_tex = 0;
+    for (int st = 0; st < VKA_NSTAGE && !any_tex; st++) if (st != 5) {
+        for (int i = 0; i < g_wk.n[st]; i++) if (g_wk.r[st][i].what == VKA_R_TEX && g_wk.r[st][i].tid > 0) { any_tex = 1; break; }
+    }
+    if (!any_tex) return;
+    vka_img *att_im[8] = {0}; uint32_t att_lv[8] = {0}, att_l0[8] = {0}, att_nl[8] = {0}; int natt = 0;
+    if (R.on) {
+        for (int i = 0; i < nc; i++) if (R.rt_im[i]) {
+            att_im[natt] = R.rt_im[i]; att_lv[natt] = R.rt_lv[i]; att_l0[natt] = R.rt_l0[i]; att_nl[natt] = R.cnl[i]; natt++;
+        }
+    } else {
+        for (int i = 0; i < nc; i++) {
+            const tex_t *t = rt->color[i]; if (!t || rt_dup_slot(rt, i)) continue;
+            vka_img *im = vka_tex_get(t, g_cb); vka_fmt f;
+            if (!im || !vka_fmt_of(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : t->d.format, &f)) continue;
+            if (!(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || f.kind >= 3 || im->f.bc_dec) continue;
+            uint32_t lv = rt->has_cview[i] && rt->cview[i].set_levels ? rt->cview[i].base_level : 0;
+            uint32_t l0 = rt->has_cview[i] && rt->cview[i].set_layers ? rt->cview[i].min_layer : 0;
+            if (!vka_img_lv(im, &lv)) continue;
+            uint32_t all = vka_img_slices(im, lv);
+            uint32_t nl = rt->has_cview[i] && rt->cview[i].set_layers && rt->cview[i].nlayers ? rt->cview[i].nlayers : (l0 < all ? all - l0 : 0);
+            if (l0 + nl > all) nl = l0 < all ? all - l0 : 0;
+            if (!nl) continue;
+            att_im[natt] = im; att_lv[natt] = lv; att_l0[natt] = l0; att_nl[natt] = nl; natt++;
+        }
+    }
+    if (!natt) return;
+    struct { vka_img *im; uint32_t lv; } need[8]; int nneed = 0, miss = 0;
+    for (int st = 0; st < VKA_NSTAGE; st++) if (st != 5) {
+        const vka_res *r = g_wk.r[st];
+        for (int i = 0; i < g_wk.n[st]; i++) {
+            if (r[i].what != VKA_R_TEX || r[i].tid <= 0) continue;
+            vka_img *tim = NULL; uint32_t tlv = 0, tnlv = 0, tl0 = 0, tnl = 0;
+            if (!vka_tex_id_info(r[i].tid, g_cb, &tim, &tlv, &tnlv, &tl0, &tnl) || tnlv != 1) continue;
+            if (!(tim->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) continue;
+            for (int k = 0; k < natt; k++) {
+                if (att_im[k] != tim || att_lv[k] != tlv) continue;
+                if (!(att_l0[k] < tl0 + tnl && tl0 < att_l0[k] + att_nl[k])) continue;
+                if (!fb_find(tim, tlv, tl0, tnl)) miss = 1;
+                int dup = 0; for (int q = 0; q < nneed; q++) if (need[q].im == tim && need[q].lv == tlv) { dup = 1; break; }
+                if (!dup && nneed < 8) { need[nneed].im = tim; need[nneed].lv = tlv; nneed++; }
+            }
+        }
+    }
+    if (!miss) return;
+    if (R.on) vka_rp_end();
+    else if (PC.n) {
+        int touch = 0;
+        for (int k = 0; k < PC.n && !touch; k++) for (int q = 0; q < nneed; q++) if (PC.c[k].im == need[q].im) touch = 1;
+        if (touch) pc_flush();
+    }
+    int copied = 0;
+    for (int q = 0; q < nneed && g_nfb < FB_SNAP_CAP; q++) {
+        int pidx = -1;
+        vka_img *snap = fb_alloc_snap(need[q].im, need[q].lv, &pidx);
+        if (!snap) continue;
+        if (!copied) { vka_barrier(g_cb); copied = 1; }
+        vka_img *src = need[q].im; uint32_t lv = need[q].lv;
+        uint32_t pw = src->w >> lv ? src->w >> lv : 1, ph = src->h >> lv ? src->h >> lv : 1;
+        int is3d = src->d.target == NVN_TEXTURE_TARGET_3D;
+        uint32_t pl = is3d ? (src->depth >> lv ? src->depth >> lv : 1) : src->layers;
+        VkImageCopy cp = {
+            {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, is3d ? 1u : pl}, {0, 0, 0},
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, is3d ? 1u : pl}, {0, 0, 0},
+            {pw, ph, is3d ? pl : 1u}
+        };
+        vk.vkCmdCopyImage(g_cb, src->img, VK_IMAGE_LAYOUT_GENERAL, snap->img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        g_fb[g_nfb++] = (typeof(g_fb[0])){src, snap, lv, 0, is3d ? pl : src->layers, pidx};
+    }
+    if (copied) {
+        vka_barrier(g_cb);
+        static _Atomic int nfblog;
+        if (atomic_fetch_add(&nfblog, 1) < 8)
+            VLOG("feedback snapshot: %d colour attachment(s) snapshotted for same-pass sampling (%d active; DM_VK_FB_SNAP=0 off)", nneed, g_nfb);
+    }
+}
+
 void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
     static int tick;
     if (!g_prof_all && (g_prof_every <= 0 || ++tick < g_prof_every)) { draw_body(d, rt, has_rt, sc, has_sc, dw, di); return; }
@@ -2567,6 +2741,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     if (vka_rs_on()) rs_fetch_fix(sh, d);   // PEANUTS: DM_RES_SCALE: a shader that fetches by pixel sees its 2D textures at one scale
     if (R.on && R.bar_pending && bar_hazard(sh, d)) { g_bar_late++; vka_rp_end(); }   // the game barrier taken inside the pass is needed here: the pass ends (its full barrier) first
     if (R.on && UB.n && ub_hazard(d, sh, mesh, dw, di)) vka_rp_end();
+    fb_prepare(rt, has_rt);
     if (R.on && (R.df || R.sf) && rt_same(rt, has_rt, &R.rt, R.has_rt)) {   // SetRenderTargets of the same targets between a depth write and sampling depth (or sampling depth then writing it)
         int ds = (R.rt_cont || !R.dread) ? depth_sampled(sh, d) : 0;
         int hd_ = R.df != VK_FORMAT_UNDEFINED, hs_ = R.sf != VK_FORMAT_UNDEFINED;
