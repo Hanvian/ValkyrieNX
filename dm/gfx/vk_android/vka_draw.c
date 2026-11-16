@@ -2283,7 +2283,7 @@ static int bisect_drop(vka_shader *const *sh) {
 // pass so draws read the snapshot while writing to the attachment.
 static void fb_prepare(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, uint32_t *wm_out, uint32_t *rm_out) {
     *wm_out = *rm_out = 0;
-    if (!g_cb || !VKA_ENV("DM_VK_FB_SNAP", 1)) return;
+    if (!g_cb || !VKA_ENV("DM_VK_FB_SNAP", 0)) return;
     if (R.on && (!g_pass_keep || !rt_same(rt, has_rt, &R.rt, R.has_rt) || !rp_area_fits(sc, has_sc, d, rt, has_rt))) vka_rp_end();
     if (!R.on && g_nfb) fb_reset();
 
@@ -2390,7 +2390,7 @@ static void fb_prepare(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d, co
         vka_barrier(g_cb);
         static _Atomic int nfblog;
         if (atomic_fetch_add(&nfblog, 1) < 8)
-            VLOG("feedback snapshot: %d colour attachment(s) snapshotted for same-pass sampling (%d active; DM_VK_FB_SNAP=0 off)", nneed, g_nfb);
+            VLOG("feedback snapshot: %d colour attachment(s) snapshotted for same-pass sampling (%d active; DM_VK_FB_SNAP=1 on)", nneed, g_nfb);
     }
 }
 
