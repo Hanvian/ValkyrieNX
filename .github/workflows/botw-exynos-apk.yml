@@ -110,8 +110,8 @@ jobs:
               -PnxPackageId=dev.nxnative.botwexynos.peanuts \
               -PnxGames=01007EF00011E000 \
               -PnxLabel="The Legends Of Zelda: BoTW" \
-              -PnxVersion=0.1.1-exynos-v8 \
-              -PnxVersionCode=8; then
+              -PnxVersion=0.1.1-exynos-v9 \
+              -PnxVersionCode=9; then
               break
             fi
             [ "$attempt" -eq 3 ] && exit 1

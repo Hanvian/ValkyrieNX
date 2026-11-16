@@ -3206,6 +3206,29 @@ VkImageView vka_tex_id_fb_view(int id, vka_img *snap, uint8_t dim) {
     t_view_strict = 0;
     return vw;
 }
+VkFormat vka_tex_id_fb_learn(int id, const vka_img *src, uint8_t dim, uint32_t w, uint32_t h) {
+    if (!src || id <= 0) return VK_FORMAT_UNDEFINED;
+    pthread_mutex_lock(&g_tmu);
+    if (id >= g_ntreg || !g_treg[id].t.serial) { pthread_mutex_unlock(&g_tmu); return VK_FORMAT_UNDEFINED; }
+    treg_ent e = g_treg[id];
+    pthread_mutex_unlock(&g_tmu);
+    if (treg_dead(id, &e)) return VK_FORMAT_UNDEFINED;
+    vka_fmt vf = view_fmt(&e, src);
+    int want = dim & DMSH_VK_DIM_SINT ? 2 : dim & DMSH_VK_DIM_UINT ? 1 : 0, have = vf.kind == 1 ? 1 : vf.kind == 2 ? 2 : 0;
+    VkFormat ovr = VK_FORMAT_UNDEFINED;
+    if (want != have && !(vf.kind >= 3 && want == 0)) ovr = class_twin(vf.vk, want);
+    VkFormat need = ovr ? ovr : vf.view;
+    if (need && need != src->f.vk && src->f.kind <= 2 && vf.kind <= 2 && !compressed(&src->f) && !compressed(&vf) && !src->f.bc_dec && !vf.bc_dec) {
+        pthread_mutex_lock(&g_vlmu);
+        vl_learn(src->f.vk, need, w, h);
+        if (vf.vk != need) vl_learn(src->f.vk, vf.vk, w, h);
+        pthread_mutex_unlock(&g_vlmu);
+    }
+    return need;
+}
+int vka_tex_img_lists(const vka_img *im, VkFormat fmt) {
+    return im && fmt && (im->f.vk == fmt || img_lists(im, fmt));
+}
 // DM_VK_NANSCAN_DUMP: level 0 of texture ID id as its storage holds it now (deswizzled), written to DM_TEMP as nan-now-<serial>.blk
 void vka_tex_id_dump(int id) {
     pthread_mutex_lock(&g_tmu);

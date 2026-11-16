@@ -443,6 +443,8 @@ VkFormat vka_tex_id_vkfmt(int id);   // the format texture ID id is viewed in, n
 VkImageView vka_tex_id_view_bits(int id, VkCommandBuffer cb, VkImageLayout *layout);   // a storage view of its image as R32_UINT (4-byte texels), not written into the bindless table (vka_tex.c)
 int vka_tex_id_info(int id, VkCommandBuffer cb, vka_img **im, uint32_t *lv, uint32_t *nlv, uint32_t *l0, uint32_t *nl);
 VkImageView vka_tex_id_fb_view(int id, vka_img *snap, uint8_t dim);
+VkFormat vka_tex_id_fb_learn(int id, const vka_img *src, uint8_t dim, uint32_t w, uint32_t h);
+int vka_tex_img_lists(const vka_img *im, VkFormat fmt);
 int vka_tex_id_pending_rec(int id, uint8_t dim);
 int vka_tex_id_storage_pending(int id);            // texture ID id's image exists without storage use and would be remade with it at its next storage binding (a draw ends its pass first)
 int vka_tex_id_tbuf(int id, int want, int storage, uint64_t *addr, uint64_t *bytes, VkFormat *fmt, uint32_t *texel);   // PEANUTS: a buffer texture's elements as a texel buffer: guest address, bytes, view format (vka_tex.c)

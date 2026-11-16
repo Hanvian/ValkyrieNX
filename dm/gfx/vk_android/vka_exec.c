@@ -579,7 +579,7 @@ void vka_rp_sub_begin(void) {
                  vka_barrier(g_cb); }   // the re-uploads of CPU-written textures before the submission's draws read them
     vka_draw_sub_begin(g_cb, k);
     { void vka_pso_pause(int on); vka_pso_pause(0); }   // the game submits: resumed (mtl_drain paused the pipeline threads)
-    g_chunk_draws = VKA_ENV("DM_VK_CHUNK", DM_GAME_FPS_TARGET <= 30 ? 1200 : 600);   // live: from the next submission
+    g_chunk_draws = VKA_ENV("DM_VK_CHUNK", 600);   // live: from the next submission
     g_nx = 0; g_chunk_d0 = g_stat_draws;
     g_t_begin += now_ns() - tb0;
 }

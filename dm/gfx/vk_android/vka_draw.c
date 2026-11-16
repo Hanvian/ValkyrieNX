@@ -200,6 +200,7 @@ static struct {
     int swrite;                                          // a draw of the pass wrote memory (storage buffers or images, raw global stores, a geometry shader's claim)
     int bar_pending;                                     // a game barrier came inside the pass and was taken there (vka_rp_game_barrier): the draws after it are checked (bar_hazard)
     int rt_cont, dread;                                  // SET_RT continued the pass; a draw of the pass sampled its depth attachment
+    uint32_t fb_wmask, fb_rmask;                         // colour attachment slots written so far, or read directly without snapshot, in this render pass
     struct { vka_img *im, *sh; uint32_t lv, l0, nl, bw, bh, mw, mh; } bc[8]; int nbc;   // block-compressed targets drawn through their shadows (bcrt_attach), copied back at the pass end
     int rsc; float rsf;                                  // PEANUTS: its targets are scaled images (DM_RES_SCALE, vka_rp_rs), and the factor (1.0 when not): viewports and scissors are scaled by it
 } R;
@@ -218,11 +219,11 @@ static int rt_first_slot(const p_set_rt *r, int i) {
 }
 static int rt_dup_slot(const p_set_rt *r, int i) { int f = rt_first_slot(r, i); return f >= 0 && f < i; }
 
-// Same-pass colour attachment feedback snapshots (DM_VK_FB_SNAP): if a shader samples a texture subresource attached as a colour
-// target of its own pass (e.g. BotW G-buffer / decal draws), copy it once outside the pass into a pooled snapshot image and bind
-// that snapshot in stage_writes until the pass closes or an explicit OP_BARRIER / whole clear invalidates it.
-enum { FB_SNAP_CAP = 16, FB_POOL_CAP = 32 };
-static struct { int fmt, target, samples; uint32_t w, h, layers; int busy; tex_t t; } g_fb_pool[FB_POOL_CAP];
+// Same-pass colour attachment feedback snapshots (DM_VK_FB_SNAP): if a fragment shader samples a 2D colour attachment of its
+// own pass that has been written in this pass or is written by this draw, copy it once outside the pass into a pooled snapshot
+// image and bind that snapshot in stage_writes until the pass closes or an explicit OP_BARRIER invalidates it.
+enum { FB_SNAP_CAP = 16, FB_POOL_CAP = 64 };
+static struct { int fmt, target, samples; uint32_t w, h, layers; VkFormat alt_vk; int busy; tex_t t; } g_fb_pool[FB_POOL_CAP];
 static int g_nfb_pool;
 static struct { vka_img *src, *snap; uint32_t lv, l0, nl; int pool_idx; } g_fb[FB_SNAP_CAP];
 static int g_nfb;
@@ -236,30 +237,34 @@ static void fb_reset(void) {
 }
 void vka_draw_fb_barrier(void) { fb_reset(); }
 
-static vka_img *fb_find(vka_img *im, uint32_t lv, uint32_t l0, uint32_t nl) {
+static vka_img *fb_find(vka_img *im, uint32_t lv, uint32_t l0, uint32_t nl, VkFormat want_vk) {
     for (int i = 0; i < g_nfb; i++)
-        if (g_fb[i].src == im && g_fb[i].lv == lv && g_fb[i].l0 <= l0 && l0 + nl <= g_fb[i].l0 + g_fb[i].nl)
+        if (g_fb[i].src == im && g_fb[i].lv == lv && g_fb[i].l0 <= l0 && l0 + nl <= g_fb[i].l0 + g_fb[i].nl
+            && (!want_vk || vka_tex_img_lists(g_fb[i].snap, want_vk)))
             return g_fb[i].snap;
     return NULL;
 }
-static vka_img *fb_alloc_snap(vka_img *src, uint32_t lv, int *idx_out) {
+static vka_img *fb_alloc_snap(vka_img *src, uint32_t lv, VkFormat want_vk, int *idx_out) {
     uint32_t pw = src->w >> lv ? src->w >> lv : 1, ph = src->h >> lv ? src->h >> lv : 1;
-    uint32_t pl = src->d.target == NVN_TEXTURE_TARGET_3D ? (src->depth >> lv ? src->depth >> lv : 1) : src->layers;
+    int is3d = src->d.target == NVN_TEXTURE_TARGET_3D;
+    uint32_t pl = is3d ? (src->depth >> lv ? src->depth >> lv : 1) : src->layers;
     int fmt = src->d.format, tgt = src->d.target, smp = (int)src->samples, k = -1;
+    VkFormat alt = want_vk && want_vk != src->f.vk ? want_vk : VK_FORMAT_UNDEFINED;
     for (int i = 0; i < g_nfb_pool; i++) {
         if (!g_fb_pool[i].busy && g_fb_pool[i].fmt == fmt && g_fb_pool[i].target == tgt && g_fb_pool[i].samples == smp
-            && g_fb_pool[i].w == pw && g_fb_pool[i].h == ph && g_fb_pool[i].layers == pl) { k = i; break; }
+            && g_fb_pool[i].w == pw && g_fb_pool[i].h == ph && g_fb_pool[i].layers == pl && g_fb_pool[i].alt_vk == alt) { k = i; break; }
     }
     if (k < 0) {
         if (g_nfb_pool < FB_POOL_CAP) k = g_nfb_pool++;
         else { for (int i = 0; i < g_nfb_pool; i++) if (!g_fb_pool[i].busy) { k = i; break; } }
         if (k < 0) return NULL;
         tex_t *t = &g_fb_pool[k].t; memset(t, 0, sizeof *t);
-        t->d.target = tgt; t->d.width = pw; t->d.height = ph; t->d.depth = pl; t->d.levels = 1;
+        t->d.target = tgt; t->d.width = pw; t->d.height = ph; t->d.depth = is3d ? pl : 1; t->d.levels = 1;
+        t->L.layers = is3d ? 1 : pl;
         t->d.format = fmt; t->d.samples = smp;
         t->serial = 0xFB00000000000000ull + (uint64_t)(k + 1) + ((uint64_t)g_nfb_pool << 16);
         g_fb_pool[k].fmt = fmt; g_fb_pool[k].target = tgt; g_fb_pool[k].samples = smp;
-        g_fb_pool[k].w = pw; g_fb_pool[k].h = ph; g_fb_pool[k].layers = pl;
+        g_fb_pool[k].w = pw; g_fb_pool[k].h = ph; g_fb_pool[k].layers = pl; g_fb_pool[k].alt_vk = alt;
     }
     vka_img *snap = vka_tex_get(&g_fb_pool[k].t, g_cb);
     if (!snap) return NULL;
@@ -269,9 +274,10 @@ static vka_img *fb_alloc_snap(vka_img *src, uint32_t lv, int *idx_out) {
     return snap;
 }
 static VkImageView fb_view(int tid, uint8_t dim, VkImageLayout *lay) {
+    if (!g_nfb || vka_tex_id_in_pass_rec(tid, dim) != 1) return VK_NULL_HANDLE;
     vka_img *im = NULL; uint32_t lv = 0, nlv = 0, l0 = 0, nl = 0;
-    if (!g_nfb || !vka_tex_id_info(tid, g_cb, &im, &lv, &nlv, &l0, &nl) || nlv != 1) return VK_NULL_HANDLE;
-    vka_img *snap = fb_find(im, lv, l0, nl);
+    if (!vka_tex_id_info(tid, g_cb, &im, &lv, &nlv, &l0, &nl) || nlv != 1) return VK_NULL_HANDLE;
+    vka_img *snap = fb_find(im, lv, l0, nl, VK_FORMAT_UNDEFINED);
     if (!snap) return VK_NULL_HANDLE;
     VkImageView v = vka_tex_id_fb_view(tid, snap, dim);
     if (v && lay) *lay = VK_IMAGE_LAYOUT_GENERAL;
@@ -1629,7 +1635,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
             if (r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
                 int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0;
-                if (tid && r[i].what == VKA_R_TEX && R.on && g_nfb) v = fb_view(tid, r[i].dim, &lay);
+                if (tid && st == 1 && r[i].what == VKA_R_TEX && R.on && g_nfb) v = fb_view(tid, r[i].dim, &lay);
                 if (tid && !v) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
                 if (tid && v) class_note(sh, st, &r[i], tid, storage);
                 if (tid) tex_peek(sh->key, st, &r[i], v, storage);
@@ -2275,20 +2281,45 @@ static int bisect_drop(vka_shader *const *sh) {
 // Same-pass colour attachment feedback (DM_VK_FB_SNAP): if graphics stages sample a texture subresource also attached as a
 // colour target of this pass (either already open in R or about to open from rt), snapshot each such target once outside the
 // pass so draws read the snapshot while writing to the attachment.
-static void fb_prepare(const p_set_rt *rt, int has_rt) {
+static void fb_prepare(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, uint32_t *wm_out, uint32_t *rm_out) {
+    *wm_out = *rm_out = 0;
     if (!g_cb || !VKA_ENV("DM_VK_FB_SNAP", 1)) return;
+    if (R.on && (!g_pass_keep || !rt_same(rt, has_rt, &R.rt, R.has_rt) || !rp_area_fits(sc, has_sc, d, rt, has_rt))) vka_rp_end();
     if (!R.on && g_nfb) fb_reset();
+
+    const vka_shader *fs = d->rast_discard ? NULL : sh[1];
     int nc = R.on ? (int)(R.ncolor < 8 ? R.ncolor : 8) : (has_rt && rt ? (rt->n < 8 ? rt->n : 8) : 0);
     if (nc <= 0) return;
-    int any_tex = 0;
-    for (int st = 0; st < VKA_NSTAGE && !any_tex; st++) if (st != 5) {
-        for (int i = 0; i < g_wk.n[st]; i++) if (g_wk.r[st][i].what == VKA_R_TEX && g_wk.r[st][i].tid > 0) { any_tex = 1; break; }
+
+    uint32_t wm = 0;
+    if (fs) {
+        for (int i = 0; i < nc; i++) {
+            if (R.on ? !R.rt_im[i] : (!rt->color[i] || rt_dup_slot(rt, i))) continue;
+            if (((d->chmask.mask >> (4 * i)) & 0xf) && (fs->e->fout_mask >> i & 1)) wm |= 1u << i;
+        }
     }
-    if (!any_tex) return;
+    if (R.on && (wm & R.fb_rmask)) vka_rp_end();
+    *wm_out = wm;
+
+    if (!fs || g_wk.n[1] <= 0) return;
+    const vka_res *r = g_wk.r[1];
+    int nr = g_wk.n[1];
+    if (R.on) {
+        int hit = 0;
+        for (int i = 0; i < nr; i++) {
+            if (r[i].what == VKA_R_TEX && r[i].tid > 0 && vka_tex_id_in_pass_rec(r[i].tid, r[i].dim) == 1) { hit = 1; break; }
+        }
+        if (!hit) return;
+    } else {
+        int any = 0;
+        for (int i = 0; i < nr; i++) if (r[i].what == VKA_R_TEX && r[i].tid > 0) { any = 1; break; }
+        if (!any) return;
+    }
+
     vka_img *att_im[8] = {0}; uint32_t att_lv[8] = {0}, att_l0[8] = {0}, att_nl[8] = {0}; int natt = 0;
     if (R.on) {
         for (int i = 0; i < nc; i++) if (R.rt_im[i]) {
-            att_im[natt] = R.rt_im[i]; att_lv[natt] = R.rt_lv[i]; att_l0[natt] = R.rt_l0[i]; att_nl[natt] = R.cnl[i]; natt++;
+            att_im[i] = R.rt_im[i]; att_lv[i] = R.rt_lv[i]; att_l0[i] = R.rt_l0[i]; att_nl[i] = R.cnl[i]; natt++;
         }
     } else {
         for (int i = 0; i < nc; i++) {
@@ -2303,25 +2334,33 @@ static void fb_prepare(const p_set_rt *rt, int has_rt) {
             uint32_t nl = rt->has_cview[i] && rt->cview[i].set_layers && rt->cview[i].nlayers ? rt->cview[i].nlayers : (l0 < all ? all - l0 : 0);
             if (l0 + nl > all) nl = l0 < all ? all - l0 : 0;
             if (!nl) continue;
-            att_im[natt] = im; att_lv[natt] = lv; att_l0[natt] = l0; att_nl[natt] = nl; natt++;
+            att_im[i] = im; att_lv[i] = lv; att_l0[i] = l0; att_nl[i] = nl; natt++;
         }
     }
     if (!natt) return;
-    struct { vka_img *im; uint32_t lv; } need[8]; int nneed = 0, miss = 0;
-    for (int st = 0; st < VKA_NSTAGE; st++) if (st != 5) {
-        const vka_res *r = g_wk.r[st];
-        for (int i = 0; i < g_wk.n[st]; i++) {
-            if (r[i].what != VKA_R_TEX || r[i].tid <= 0) continue;
-            vka_img *tim = NULL; uint32_t tlv = 0, tnlv = 0, tl0 = 0, tnl = 0;
-            if (!vka_tex_id_info(r[i].tid, g_cb, &tim, &tlv, &tnlv, &tl0, &tnl) || tnlv != 1) continue;
-            if (!(tim->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) continue;
-            for (int k = 0; k < natt; k++) {
-                if (att_im[k] != tim || att_lv[k] != tlv) continue;
-                if (!(att_l0[k] < tl0 + tnl && tl0 < att_l0[k] + att_nl[k])) continue;
-                if (!fb_find(tim, tlv, tl0, tnl)) miss = 1;
-                int dup = 0; for (int q = 0; q < nneed; q++) if (need[q].im == tim && need[q].lv == tlv) { dup = 1; break; }
-                if (!dup && nneed < 8) { need[nneed].im = tim; need[nneed].lv = tlv; nneed++; }
+
+    uint32_t rw_mask = wm | (R.on ? R.fb_wmask : 0u);
+    struct { vka_img *im; uint32_t lv; VkFormat want_vk; } need[8]; int nneed = 0, miss = 0;
+    for (int i = 0; i < nr; i++) {
+        if (r[i].what != VKA_R_TEX || r[i].tid <= 0) continue;
+        if ((r[i].dim & DMSH_VK_DIM_MASK) != 1 || (r[i].dim & (DMSH_VK_DIM_ARRAY | DMSH_VK_DIM_MS))) continue;
+        if (R.on && vka_tex_id_in_pass_rec(r[i].tid, r[i].dim) != 1) continue;
+        vka_img *tim = NULL; uint32_t tlv = 0, tnlv = 0, tl0 = 0, tnl = 0;
+        if (!vka_tex_id_info(r[i].tid, g_cb, &tim, &tlv, &tnlv, &tl0, &tnl) || tnlv != 1 || tnl != 1) continue;
+        if (tim->d.target != NVN_TEXTURE_TARGET_2D || tim->layers != 1 || tim->depth != 1 || tim->samples != 1) continue;
+        if (!(tim->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) continue;
+        for (int k = 0; k < nc; k++) {
+            if (att_im[k] != tim || att_lv[k] != tlv || att_nl[k] != 1 || att_l0[k] != tl0) continue;
+            if (!((rw_mask >> k) & 1u)) { *rm_out |= 1u << k; continue; }
+            uint32_t pw = tim->w >> tlv ? tim->w >> tlv : 1u, ph = tim->h >> tlv ? tim->h >> tlv : 1u;
+            VkFormat want_vk = vka_tex_id_fb_learn(r[i].tid, tim, r[i].dim, pw, ph);
+            if (!fb_find(tim, tlv, tl0, tnl, want_vk)) miss = 1;
+            int dup = 0;
+            for (int q = 0; q < nneed; q++) if (need[q].im == tim && need[q].lv == tlv) {
+                if (want_vk && want_vk != tim->f.vk) need[q].want_vk = want_vk;
+                dup = 1; break;
             }
+            if (!dup && nneed < 8) { need[nneed].im = tim; need[nneed].lv = tlv; need[nneed].want_vk = want_vk; nneed++; }
         }
     }
     if (!miss) return;
@@ -2334,20 +2373,18 @@ static void fb_prepare(const p_set_rt *rt, int has_rt) {
     int copied = 0;
     for (int q = 0; q < nneed && g_nfb < FB_SNAP_CAP; q++) {
         int pidx = -1;
-        vka_img *snap = fb_alloc_snap(need[q].im, need[q].lv, &pidx);
+        vka_img *snap = fb_alloc_snap(need[q].im, need[q].lv, need[q].want_vk, &pidx);
         if (!snap) continue;
         if (!copied) { vka_barrier(g_cb); copied = 1; }
         vka_img *src = need[q].im; uint32_t lv = need[q].lv;
         uint32_t pw = src->w >> lv ? src->w >> lv : 1, ph = src->h >> lv ? src->h >> lv : 1;
-        int is3d = src->d.target == NVN_TEXTURE_TARGET_3D;
-        uint32_t pl = is3d ? (src->depth >> lv ? src->depth >> lv : 1) : src->layers;
         VkImageCopy cp = {
-            {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, is3d ? 1u : pl}, {0, 0, 0},
-            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, is3d ? 1u : pl}, {0, 0, 0},
-            {pw, ph, is3d ? pl : 1u}
+            {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1u}, {0, 0, 0},
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1u}, {0, 0, 0},
+            {pw, ph, 1u}
         };
         vk.vkCmdCopyImage(g_cb, src->img, VK_IMAGE_LAYOUT_GENERAL, snap->img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-        g_fb[g_nfb++] = (typeof(g_fb[0])){src, snap, lv, 0, is3d ? pl : src->layers, pidx};
+        g_fb[g_nfb++] = (typeof(g_fb[0])){src, snap, lv, 0, 1u, pidx};
     }
     if (copied) {
         vka_barrier(g_cb);
@@ -2741,7 +2778,8 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     if (vka_rs_on()) rs_fetch_fix(sh, d);   // PEANUTS: DM_RES_SCALE: a shader that fetches by pixel sees its 2D textures at one scale
     if (R.on && R.bar_pending && bar_hazard(sh, d)) { g_bar_late++; vka_rp_end(); }   // the game barrier taken inside the pass is needed here: the pass ends (its full barrier) first
     if (R.on && UB.n && ub_hazard(d, sh, mesh, dw, di)) vka_rp_end();
-    fb_prepare(rt, has_rt);
+    uint32_t fb_wm = 0, fb_rm = 0;
+    fb_prepare(sh, d, rt, has_rt, sc, has_sc, &fb_wm, &fb_rm);
     if (R.on && (R.df || R.sf) && rt_same(rt, has_rt, &R.rt, R.has_rt)) {   // SetRenderTargets of the same targets between a depth write and sampling depth (or sampling depth then writing it)
         int ds = (R.rt_cont || !R.dread) ? depth_sampled(sh, d) : 0;
         int hd_ = R.df != VK_FORMAT_UNDEFINED, hs_ = R.sf != VK_FORMAT_UNDEFINED;
@@ -2763,6 +2801,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         vka_nan_inputs(g_cb, ims, bs, ts, m, tstats);
     }
     if (!rp_begin(rt, has_rt, sc, has_sc, d)) { g_skipped++; return; }
+    R.fb_wmask |= fb_wm; R.fb_rmask |= fb_rm;
     if ((R.df || R.sf) && !R.dread && depth_sampled(sh, d)) R.dread = 1;
     if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
     d->b.samples = R.samples;
