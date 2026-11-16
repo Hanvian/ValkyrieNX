@@ -97,6 +97,11 @@ int main(void) {
         check(three == 4 && m.s.k == 2 && m.game == m.real, b);
         run(&m, 300, 3.5, 2, 2, 0);
         check(m.s.k == 2, "  frames longer than the hold at the 30 cap: hold stays 2 (the 30 Hz link holds only even counts)");
+        sim ov = {0}; run(&ov, 60, 0.5, 2, 2, 0); run(&ov, 12, 2.5, 2, 2, 0);
+        uint64_t paid0 = ov.s.paid; double game0 = ov.game;
+        run(&ov, 300, 2.5, 2, 2, 0);
+        snprintf(b, sizeof b, "  sustained overload at the 30 cap drops debt instead of bursting step 3 (paid +%llu, game +%.0f)", (unsigned long long)(ov.s.paid - paid0), ov.game - game0);
+        check(ov.s.k == 2 && ov.s.paid == paid0 && ov.game - game0 == 600, b);
     }
     {   sim m = {0}; run(&m, 60, 0.5, 1, 3, 0); run(&m, 1, 0.5, 2, 3, 0);
         check(m.s.k == 2, "movie flag (kmin 2): hold 2 at once");
