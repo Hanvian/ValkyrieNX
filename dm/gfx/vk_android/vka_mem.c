@@ -50,6 +50,7 @@ static seg_t *g_sg; static int g_nsg, g_sgcap;   // sorted by lo, disjoint
 static _Atomic uint64_t g_sg_gen = 1;
 uint64_t vka_mem_gen(void) { return atomic_load_explicit(&g_sg_gen, memory_order_acquire); }   // (vka_draw.c gmem_map: the table is kept while it stands)
 static pthread_rwlock_t g_rw = PTHREAD_RWLOCK_INITIALIZER;
+static vkh_tab g_unreadable;   // PROT_NONE sub-ranges seen at placement; skipped by cache maintenance when V.fd_noncoherent
 static pthread_mutex_t g_pl = PTHREAD_MUTEX_INITIALIZER;   // table changes and placements, one at a time (see Locks above)
 static int lock_whole(void) { static int v = -1; if (v < 0) { v = VKA_ENV("DM_VK_MEM_LOCK_WHOLE", 0) != 0; if (v) VLOG("DM_VK_MEM_LOCK_WHOLE=1: placements hold the segment table's write lock (lookups wait for them)"); } return v; }
 // Attribution ([longframe], vka_perf.c): time in placements and give-backs (any thread), and lookups that waited for the table's lock (the replay thread's and the others')
@@ -412,7 +413,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow) {
     VkDeviceSize n = hi - lo; seg_t s = {lo, hi, .refs = 1}; VkResult r; uint64_t p0 = mono_ns(), p1, p2, p3, p4, p5;
     vka_fd_memory exported = {.fd = -1};
     if (V.fd_alias) {
-        r = vka_fd_create(&vk, V.pd, V.dev, &V.memp, n, V.bda, &exported);
+        r = vka_fd_create(&vk, V.pd, V.dev, &V.memp, n, V.bda, V.fd_noncoherent, &exported);
         if (r) { VRED("pool memory %#lx+%#llx: exported allocation %d", (unsigned long)lo, (unsigned long long)n, r); return 0; }
         s.buf = exported.buf; s.mem = exported.mem; s.fd_alias = exported.fd_map_only ? 2 : 1;
     } else {
@@ -440,6 +441,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow) {
     prot_readonly(pr, npr);   // writers wait in the fault hook from here
     if ((s.fd_alias ? (p = exported.mapped, 0) : vk.vkMapMemory(V.dev, s.mem, 0, VK_WHOLE_SIZE, 0, &p)) == 0 && p) {
         copy_readable(p, lo, pr, npr);
+        if (V.fd_noncoherent) vka_fd_cache_op(p, (size_t)n, 0);
         p3 = mono_ns(); g_ph[2] += p3 - p2; p2 = p3;
         replaced = 1;   // (from here the range's pages are replaced: the placed map, or anonymous pages with the bytes after a failed one)
         if (s.fd_alias) {
@@ -481,6 +483,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow) {
     if (V.bda) { VkBufferDeviceAddressInfo bai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = s.buf}; s.bda = vk.vkGetBufferDeviceAddress(V.dev, &bai); }
     if (!lock_whole()) pthread_rwlock_wrlock(&g_rw);
     sg_insert(&s);
+    if (V.fd_noncoherent) { for (int i = 0; i < npr; i++) if (pr[i].prot >= 0 && !(pr[i].prot & PROT_READ)) vkh_add(&g_unreadable, pr[i].lo, pr[i].hi); }
     g_placed_bytes += n; if (g_placed_bytes > g_placed_peak) g_placed_peak = g_placed_bytes; t_place_bytes += n;
     if (!lock_whole()) pthread_rwlock_unlock(&g_rw);
     vka_mem_grew(n);   // (its log line outside the table's lock: no log line under a lock another logging thread may wait for)
@@ -520,6 +523,7 @@ static void detach(int i, segvec *v) {   // caller holds g_pl, and g_rw for writ
     if (g_npend == g_pendcap) { g_pendcap = g_pendcap ? 2 * g_pendcap : 16; g_pend = realloc(g_pend, (size_t)g_pendcap * sizeof *g_pend); }
     g_pend[g_npend].lo = g_sg[i].lo; g_pend[g_npend++].hi = g_sg[i].hi;
     pthread_mutex_unlock(&g_pendmu);
+    if (g_unreadable.n) vkh_cut(&g_unreadable, g_sg[i].lo, g_sg[i].hi);
     if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 8; v->s = realloc(v->s, (size_t)v->cap * sizeof *v->s); }
     v->s[v->n++] = g_sg[i]; g_placed_bytes -= g_sg[i].hi - g_sg[i].lo;
     atomic_fetch_add(&g_sg_gen, 1);
@@ -870,6 +874,35 @@ int vka_mem_chunks(uint64_t *lo, uint64_t *hi, uint64_t *bda, int max) {
     if (n == max && n < g_nsg) VRED_ONCE("more than %d placed segments: raw global memory sees the first %d", max, max);
     pthread_rwlock_unlock(&g_rw);
     return n;
+}
+
+static void cache_sync_readable(uintptr_t lo, uintptr_t hi, int inval) {   // caller holds g_rw
+    if (hi <= lo) return;
+    if (!g_hole.n && !g_unreadable.n) { vka_fd_cache_op((const void *)lo, (size_t)(hi - lo), inval); return; }
+    for (uint64_t at1 = lo, a, e; vkh_next_piece(&g_hole, lo, hi, &at1, &a, &e);) {
+        if (!g_unreadable.n) { vka_fd_cache_op((const void *)(uintptr_t)a, (size_t)(e - a), inval); continue; }
+        for (uint64_t at2 = a, ra, re; vkh_next_piece(&g_unreadable, a, e, &at2, &ra, &re);)
+            vka_fd_cache_op((const void *)(uintptr_t)ra, (size_t)(re - ra), inval);
+    }
+}
+void vka_mem_sync_gpu_reads(void) {
+    if (!V.fd_noncoherent) return;
+    pthread_rwlock_rdlock(&g_rw);
+    for (int i = 0; i < g_nsg; i++) if (g_sg[i].fd_alias) cache_sync_readable(g_sg[i].lo, g_sg[i].hi, 0);
+    pthread_rwlock_unlock(&g_rw);
+}
+void vka_mem_inval_range(uint64_t addr, uint64_t len) {
+    if (!V.fd_noncoherent || !len || !addr) return;
+    uintptr_t qlo = (uintptr_t)addr, qhi = (addr + len >= addr && addr + len <= UINTPTR_MAX) ? (uintptr_t)(addr + len) : UINTPTR_MAX;
+    pthread_rwlock_rdlock(&g_rw);
+    int i = sg_find(qlo);
+    if (i < 0) i = 0;
+    for (; i < g_nsg && g_sg[i].lo < qhi; i++) if (g_sg[i].fd_alias) {
+        uintptr_t ilo = qlo > g_sg[i].lo ? qlo : g_sg[i].lo;
+        uintptr_t ihi = qhi < g_sg[i].hi ? qhi : g_sg[i].hi;
+        if (ilo < ihi) cache_sync_readable(ilo, ihi, 1);
+    }
+    pthread_rwlock_unlock(&g_rw);
 }
 
 // ---------- Pools ----------

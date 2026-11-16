@@ -2293,12 +2293,14 @@ void vka_tex_writeback(VkCommandBuffer cb) {
     for (int i = 0; i < g_nwb; i++) {
         vka_img *im = g_wb[i]; im->wb_pending = 0;
         uint32_t bpb = im->f.bpb, h = im->h; size_t row = im->d.stride ? im->d.stride : (size_t)im->w * bpb;
+        uint64_t wb_bytes = (uint64_t)row * (h - 1) + (uint64_t)im->w * bpb;
         VkBuffer b; VkDeviceSize o;
-        if (row % bpb || !vka_addr((uint64_t)(uintptr_t)im->mem, (uint64_t)row * (h - 1) + (uint64_t)im->w * bpb, &b, &o, NULL) || o % (bpb % 4 ? 4 * bpb : bpb)) {
+        if (row % bpb || !vka_addr((uint64_t)(uintptr_t)im->mem, wb_bytes, &b, &o, NULL) || o % (bpb % 4 ? 4 * bpb : bpb)) {
             VRED_ONCE("linear texture serial %llu (format %#x, row %zu) cannot be copied back into its storage: the CPU reads what it held", (unsigned long long)im->serial, im->d.format, row); unref_locked(im); continue; }
         if (!any) { vka_barrier(cb); any = 1; }
         VkBufferImageCopy c = {o, (uint32_t)(row / bpb), h, {im->aspect, 0, 0, 1}, {0, 0, 0}, {im->w, h, 1}};
         vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c);
+        vka_exec_note_gpu_write((uint64_t)(uintptr_t)im->mem, wb_bytes);
         static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("linear texture serial %llu %ux%u format %#x: the GPU's content copied back into its storage", (unsigned long long)im->serial, im->w, h, im->d.format);
         unref_locked(im);
     }

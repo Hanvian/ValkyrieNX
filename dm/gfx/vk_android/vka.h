@@ -30,7 +30,7 @@ static inline int vka_red_repeat(void) { static int n = -1; if (n < 0) { const c
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)
 #define VKA_DEVICE_FNS(X) \
     X(vkGetDeviceQueue) X(vkDeviceWaitIdle) X(vkQueueSubmit) X(vkQueueWaitIdle) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements) \
-    X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkMapMemory2KHR) X(vkUnmapMemory2KHR) X(vkGetMemoryFdKHR) \
+    X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkMapMemory2KHR) X(vkUnmapMemory2KHR) X(vkGetMemoryFdKHR) X(vkGetAndroidHardwareBufferPropertiesANDROID) \
     X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkGetBufferDeviceAddress) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkGetImageMemoryRequirements2) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkCreateSampler) X(vkDestroySampler) \
@@ -87,7 +87,7 @@ void vka_exec_counts(uint64_t *ops, uint64_t *subs, uint64_t *rec_ns);   // vka_
 typedef struct {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qf;
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties memp;
-    int placed, placed_range, unmap_reserve, fd_alias, bda, uab, display_timing, has_android_surface;
+    int placed, placed_range, unmap_reserve, fd_alias, fd_noncoherent, bda, uab, display_timing, has_android_surface;
     int mem_budget;                                 // VK_EXT_memory_budget: the texture cache's limit reads the image heap's budget and usage (vka_tex.c, vka_texlimit.h)
     void *perf_hint;                                // vkQueueSetPerfHintQCOM (VK_QCOM_queue_perf_hint), NULL without it: vka_gpu_floor
     // The draw path's device facts: push descriptors (and how many a set may hold), vertex input dynamic state, robustness2's null descriptors, 8-bit indices,
@@ -239,6 +239,9 @@ void *vka_mem_mapped(size_t n);   // no placed maps: a mapped allocation as a se
 int vka_mem_chunks(uint64_t *lo, uint64_t *hi, uint64_t *bda, int max);   // the placed segments by address (guest range and device address); the count
 uint64_t vka_mem_sink(void);   // raw global memory's sink for accesses in no pool (entry 0 of its table); 0 if none
 uint64_t vka_mem_placed_bytes(uint64_t *peak);     // bytes of placed Vulkan memory now (and the peak)
+void vka_mem_sync_gpu_reads(void);                 // clean CPU D-cache across readable placed guest memory before GPU submission when V.fd_noncoherent
+void vka_mem_inval_range(uint64_t addr, uint64_t len);   // clean+invalidate CPU D-cache over GPU-written placed range [addr, addr+len) before CPU reads when V.fd_noncoherent
+void vka_exec_note_gpu_write(uint64_t addr, uint64_t len);
 
 // ---------- Textures (vka_tex.c) ----------
 typedef struct {

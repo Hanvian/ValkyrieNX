@@ -30,7 +30,8 @@ static void put_ver(outbuf *o, const char *key, uint32_t v) { put(o, "%s=%u.%u.%
 
 // The extensions a requirement or the report may name; each one present is "ext.<name>=1"
 static const char *const k_exts[] = {
-    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+    "VK_ANDROID_external_memory_android_hardware_buffer", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
     VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, VK_KHR_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME,
     VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,
     VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
@@ -45,7 +46,7 @@ static const struct { const char *name; VkFormat f; } k_sparse_fmt[] = {
 
 // A driver that has placed maps without advertising them (vka_dev.c vka_placed_probe: Qualcomm 512.863 on the Adreno 740): a device of its own on queue family 0,
 // one placed map of a 64 KiB host-visible allocation at a reserved address through vkMapMemory2 (core 1.4 name). 1 when it lands there and reads back
-static int placed_unadvertised(PFN_vkGetInstanceProcAddr gipa, VkInstance inst, VkPhysicalDevice pd, int map2_ext, int fd_ext, outbuf *o, int *fd_alias) {
+static int placed_unadvertised(PFN_vkGetInstanceProcAddr gipa, VkInstance inst, VkPhysicalDevice pd, int map2_ext, int fd_ext, int ahb_ext, outbuf *o, int *fd_alias) {
     const char *e = getenv("DM_VK_PLACED_PROBE"); int try_placed = !e || strcmp(e, "0");
 #define I(f) PFN_##f f = (PFN_##f)gipa(inst, #f);
     I(vkCreateDevice) I(vkGetDeviceProcAddr) I(vkGetPhysicalDeviceMemoryProperties)
@@ -53,9 +54,10 @@ static int placed_unadvertised(PFN_vkGetInstanceProcAddr gipa, VkInstance inst, 
 #undef I
     if (!vkCreateDevice || !vkGetDeviceProcAddr || !vkGetPhysicalDeviceMemoryProperties) return 0;
     float prio = 1; VkDeviceQueueCreateInfo q = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &prio};
-    const char *exts[2]; uint32_t next = 0;
+    const char *exts[4]; uint32_t next = 0;
     if (map2_ext) exts[next++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
     if (fd_ext) exts[next++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+    if (ahb_ext) exts[next++] = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
     VkPhysicalDeviceBufferDeviceAddressFeatures bda = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &bda};
     if (vkGetPhysicalDeviceFeatures2) vkGetPhysicalDeviceFeatures2(pd, &features);
@@ -95,14 +97,15 @@ static int placed_unadvertised(PFN_vkGetInstanceProcAddr gipa, VkInstance inst, 
             vkFreeMemory(dev, mem, NULL);
         }
     }
-    if (!ok && fd_ext && vka_fd_enabled()) {
+    if (!ok && (fd_ext || ahb_ext) && vka_fd_enabled()) {
         vka_fns f = {.vkGetPhysicalDeviceExternalBufferProperties = (PFN_vkGetPhysicalDeviceExternalBufferProperties)gipa(inst, "vkGetPhysicalDeviceExternalBufferProperties")};
 #define FD_LOAD(fn) f.fn = (PFN_##fn)vkGetDeviceProcAddr(dev, #fn);
         FD_LOAD(vkCreateBuffer) FD_LOAD(vkDestroyBuffer) FD_LOAD(vkGetBufferMemoryRequirements) FD_LOAD(vkBindBufferMemory)
         FD_LOAD(vkAllocateMemory) FD_LOAD(vkFreeMemory) FD_LOAD(vkMapMemory) FD_LOAD(vkUnmapMemory) FD_LOAD(vkGetMemoryFdKHR)
+        FD_LOAD(vkGetAndroidHardwareBufferPropertiesANDROID)
 #undef FD_LOAD
-        char why[160]; *fd_alias = vka_fd_probe(&f, pd, dev, &mp, bda.bufferDeviceAddress, why, sizeof why);
-        put(o, "memory.fdAlias=%d\nmemory.fdAliasProbe=%s\n", *fd_alias, why);
+        char why[160]; int nc = 0; *fd_alias = vka_fd_probe(&f, pd, dev, &mp, bda.bufferDeviceAddress, fd_ext, ahb_ext, &nc, why, sizeof why);
+        put(o, "memory.fdAlias=%d\nmemory.fdAliasNonCoherent=%d\nmemory.fdAliasProbe=%s\n", *fd_alias, nc, why);
     }
     if (vkDestroyDevice) vkDestroyDevice(dev, NULL);
     return ok;
@@ -144,7 +147,7 @@ __attribute__((visibility("default"))) int nxhost_vk_readiness(char *buf, int n)
     // Extensions
     uint32_t nde = 0; vkEnumerateDeviceExtensionProperties(pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(pd, NULL, &nde, de);
-    int mesh = 0, placed = 0, map2_ext = 0, fd_ext = 0;
+    int mesh = 0, placed = 0, map2_ext = 0, fd_ext = 0, ahb_ext = 0;
     for (size_t k = 0; k < sizeof k_exts / sizeof *k_exts; k++)
         for (uint32_t i = 0; i < nde; i++) if (!strcmp(de[i].extensionName, k_exts[k])) {
             put(&o, "ext.%s=1\n", k_exts[k]);
@@ -152,12 +155,13 @@ __attribute__((visibility("default"))) int nxhost_vk_readiness(char *buf, int n)
             if (!strcmp(k_exts[k], VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME)) placed = 1;
             if (!strcmp(k_exts[k], VK_KHR_MAP_MEMORY_2_EXTENSION_NAME)) map2_ext = 1;
             if (!strcmp(k_exts[k], VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) fd_ext = 1;
+            if (!strcmp(k_exts[k], VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME)) ahb_ext = 1;
             break;
         }
     put(&o, "ext.count=%u\n", nde);
     free(de);
     // Placed maps the driver has but does not advertise count as present (the replay uses them the same way: vka_dev.c)
-    int fd_alias = 0, placed_hidden = !placed && placed_unadvertised(gipa, inst, pd, map2_ext, fd_ext, &o, &fd_alias);
+    int fd_alias = 0, placed_hidden = !placed && placed_unadvertised(gipa, inst, pd, map2_ext, fd_ext, ahb_ext, &o, &fd_alias);
     if (placed_hidden) put(&o, "ext.%s=1\next.%s=1\nplaced.unadvertised=1\n", VK_KHR_MAP_MEMORY_2_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
 
     // Driver identity (1.2 core) and the 1.1 / 1.3 properties the requirements may name

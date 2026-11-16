@@ -138,7 +138,7 @@ static int init_once(void) {
 
     uint32_t nde = 0; vk.vkEnumerateDeviceExtensionProperties(V.pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vk.vkEnumerateDeviceExtensionProperties(V.pd, NULL, &nde, de);
-    const char *dext[24]; uint32_t ndext = 0;
+    const char *dext[32]; uint32_t ndext = 0;
     { char q[700]; size_t qn = 0; q[0] = 0;   // the vendor's own extensions (tile properties, render pass transforms ...): what a tiler-specific path could use
       for (uint32_t i = 0; i < nde && qn < sizeof q; i++) if (strstr(de[i].extensionName, "_QCOM_")) qn += (size_t)snprintf(q + qn, sizeof q - qn, " %s", de[i].extensionName + 3);
       if (qn) VLOG("device extensions of the vendor:%s", q); }
@@ -148,7 +148,9 @@ static int init_once(void) {
     if (map2) dext[ndext++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
     if (placed) dext[ndext++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
     int x_fd = has_ext(de, nde, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+    int x_ahb = has_ext(de, nde, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
     if (x_fd) dext[ndext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+    if (x_ahb) dext[ndext++] = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
     if (V.display_timing) dext[ndext++] = VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
     // The draw path (vka_draw.c): each one optional, with a fallback when absent
     int x_push = has_ext(de, nde, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME), x_vin = has_ext(de, nde, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
@@ -239,8 +241,8 @@ static int init_once(void) {
         const char *e = getenv("DM_VK_PLACED_PROBE");
         if (!e || strcmp(e, "0")) V.placed = vka_placed_probe();
     }
-    if (!V.placed && x_fd && vka_fd_enabled()) {
-        char why[160]; V.fd_alias = vka_fd_probe(&vk, V.pd, V.dev, &V.memp, V.bda, why, sizeof why);
+    if (!V.placed && (x_fd || x_ahb) && vka_fd_enabled()) {
+        char why[160]; V.fd_alias = vka_fd_probe(&vk, V.pd, V.dev, &V.memp, V.bda, x_fd, x_ahb, &V.fd_noncoherent, why, sizeof why);
         VLOG("exported guest memory alias: %s (%s; DM_VK_FD_ALIAS=0: off)", V.fd_alias ? "on" : "unavailable", why);
     }
     vk.vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
@@ -305,6 +307,7 @@ static int init_once(void) {
     V.ub_align = lim->minUniformBufferOffsetAlignment ? lim->minUniformBufferOffsetAlignment : 256; V.sb_align = lim->minStorageBufferOffsetAlignment ? lim->minStorageBufferOffsetAlignment : 256;
     vka_tex_pfb_flags();   // texture pool reads decided (and their buffers made) here, before any module is made, so no module's hook makes them under a caller's lock
     V.ub_range = lim->maxUniformBufferRange; V.sb_range = lim->maxStorageBufferRange; V.max_vin_bindings = lim->maxVertexInputBindings;
+    if (V.fd_noncoherent && (!V.max_alloc || V.max_alloc > (128ull << 20))) V.max_alloc = 128ull << 20;
 
     VkMemoryPropertyFlags HV = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     V.guest_type = vka_mem_type(~0u, HV | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);

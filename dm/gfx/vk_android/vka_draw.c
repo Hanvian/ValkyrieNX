@@ -284,6 +284,7 @@ int vka_rp_ub_defer(uint64_t dst, uint64_t n, const void *data) {
     if (dst + n > UB.hi) UB.hi = dst + n;
     UB.seq++; UB.m_valid = 0;
     vka_tex_gw_update(dst, n, data);
+    vka_exec_note_gpu_write(dst, n);
     { void inst_reset_on_ub(void); inst_reset_on_ub(); }
     return 1;
 }
@@ -1503,7 +1504,10 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             switch (r[i].what) {
             case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
-                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
+                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) {
+                    vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
+                    vka_exec_note_gpu_write(r[i].addr, bi->range);
+                }
                 if (ok && storage) sb_peek_note(sh->key, st, &r[i]);
                 if (ok && !storage) ub_peek_note(sh->key, st, &r[i]);
                 if (ok) sb_watch_use(sh->key, st, &r[i], storage, bi);

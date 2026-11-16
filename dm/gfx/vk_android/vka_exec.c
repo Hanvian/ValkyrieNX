@@ -171,10 +171,26 @@ void vka_rp_prog_forget(const prog_t *p) {
     if (active || inactive) { static unsigned n; if (!n++ || !(n & (n - 1))) VLOG("finalized program %p dropped from queue bindings (active queue %d, inactive queues %d; %u times so far)", (const void *)p, active, inactive, n); }
 }
 
+enum { POP_INVAL = 7 };
 static void post(pop o) {
     if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, (size_t)g_postcap * sizeof *g_post); }
     g_post[g_npost++] = o;
 }
+static void post_inval(uint64_t addr, uint64_t len) {
+    if (!V.fd_noncoherent || !len || !addr) return;
+    uint64_t end = addr + len; if (end < addr) end = UINT64_MAX;
+    for (int i = g_npost - 1; i >= 0 && i >= g_npost - 32; i--) if (g_post[i].kind == POP_INVAL) {
+        uint64_t ilo = g_post[i].addr, ihi = ilo + g_post[i].q0;
+        if (addr <= ihi && end >= ilo) {
+            if (addr < ilo) ilo = addr;
+            if (end > ihi) ihi = end;
+            g_post[i].addr = ilo; g_post[i].q0 = ihi - ilo;
+            return;
+        }
+    }
+    post((pop){POP_INVAL, 0, 0, 0, addr, end - addr, 0});
+}
+void vka_exec_note_gpu_write(uint64_t addr, uint64_t len) { post_inval(addr, len); }
 
 // ---------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------
 // NVN's samples-passed counter is cumulative: ResetCounter(SAMPLES_PASSED) zeroes it, every draw after it adds the samples that pass the depth and stencil tests, and
@@ -346,6 +362,7 @@ static void post_run(void *ops_, int n) {   // the completion thread, in submiss
             if (shown < 4) { shown++; k += snprintf(b + k, sizeof b - (size_t)k, "%s", one); } snprintf(lb, sizeof lb, "%s", one); }
         if (nt && atomic_fetch_sub(&tslog, 1) > 0) VLOG("ts log: submission completes at %.2f ms, %d timestamp reports spanning %.2f ms (%s):%s ... last%s", fmod((double)g / 1e6, 100000.0), nt, (double)(last - first) / 1e6, g_sqp ? "segment" : "submission", b, lb); }
     for (int i = 0, q = 0; i < n; i++) {
+        if (ops[i].kind == POP_INVAL) { vka_mem_inval_range(ops[i].addr, ops[i].q0); continue; }
         if (ops[i].kind == 4) { atomic_store(&g_rc_done, ops[i].addr); continue; }   // DM_VK_RC_LOG: this submission's reports up to here are written
         if (ops[i].kind == 5 || ops[i].kind == 6) { oq_done(&ops[i], ticks); continue; }   // a counted samples-passed report, queries given back (Occlusion queries)
         if (ops[i].kind == 3) {   // the frame's span to here (the adaptive GPU clock floor)
@@ -580,6 +597,7 @@ static void part_submit(const void *a) {   // the part ends and goes to the queu
     if (pa.q != UINT32_MAX) qf.write(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qp, pa.q);
     VkResult r = vk.vkEndCommandBuffer(cb);
     VkSemaphore gs = vka_gate_sem(); VkPipelineStageFlags gst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (!r) vka_mem_sync_gpu_reads();
     if (!r) r = vka_submit(cb, 0, pa.gate && gs ? 1 : 0, &gs, &pa.gate, &gst, VK_NULL_HANDLE);
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("part of a submission: %d", r); vka_qtrace(QT_SUBMIT_ERR, 0, 0, 0, (uint32_t)r, 0, 0, 0, NULL); }
 }
@@ -697,16 +715,18 @@ static uint64_t sub_commit(uint64_t reserved, int has_sig, uint64_t signal) {
     vka_draw_peek_commit(fence);   // DM_VK_SB_PEEK: this submission's storage buffers, read again once it has completed
     int tail = 0;   // counted for the tail floor (DM_VK_GPU_FLOOR_AUTO=2): given back by the span op when it completes
     if (g_cb && g_stat_draws > g_sub_draws0) { int vka_floor_tail_add(void); tail = vka_floor_tail_add(); post((pop){3, 0, (uint32_t)tail, 0, g_job_frame_set ? g_job_frame : g_frame}); }   // the frame's span at the end of this submission with draws (post_run)
+    if (g_cb) {
+        vka_rp_end();
+        if (VKA_ENV("DM_VK_PARTLOG", 0) && g_nx) { char zb[400]; vka_rp_zstats(zb, sizeof zb); VLOG("last part of the submission of frame %llu: %llu draws%s", (unsigned long long)g_frame, (unsigned long long)(g_stat_draws - g_chunk_d0), zb); }
+        vka_disp_settle(g_cb);   // the submission's last dispatches before the steps below and the next submission's (vka_draw.c "Dispatch order")
+        vka_rw_point(g_cb, 'e', 0, 0, 0); vka_rw_commit(fence);   // DM_VK_RANGE_WATCH: the bytes at the submission's end, logged once it is done
+        vka_tex_writeback(g_cb);   // linear textures the GPU wrote, back into their storage for the CPU (queues POP_INVAL into g_post)
+        vka_tex_pfb_commit(g_cb, fence);   // the texture IDs its shaders read through the pool: copied out for the host (the barrier below) and cleared
+    }
     pop *ops = g_npost ? malloc((size_t)g_npost * sizeof *ops) : NULL; if (ops) memcpy(ops, g_post, (size_t)g_npost * sizeof *ops);
     int n = g_npost; g_npost = 0;
     ops = carry_take(fence, signal, ops, &n);
     if (!g_cb) { if (signal) vka_fence_cpu(signal, ops, n, post_run); else free(ops); return fence; }
-    vka_rp_end();
-    if (VKA_ENV("DM_VK_PARTLOG", 0) && g_nx) { char zb[400]; vka_rp_zstats(zb, sizeof zb); VLOG("last part of the submission of frame %llu: %llu draws%s", (unsigned long long)g_frame, (unsigned long long)(g_stat_draws - g_chunk_d0), zb); }
-    vka_disp_settle(g_cb);   // the submission's last dispatches before the steps below and the next submission's (vka_draw.c "Dispatch order")
-    vka_rw_point(g_cb, 'e', 0, 0, 0); vka_rw_commit(fence);   // DM_VK_RANGE_WATCH: the bytes at the submission's end, logged once it is done
-    vka_tex_writeback(g_cb);   // linear textures the GPU wrote, back into their storage for the CPU
-    vka_tex_pfb_commit(g_cb, fence);   // the texture IDs its shaders read through the pool: copied out for the host (the barrier below) and cleared
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT};
     vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     uint64_t tc0 = now_ns();
@@ -725,6 +745,7 @@ static uint64_t sub_commit(uint64_t reserved, int has_sig, uint64_t signal) {
     uint64_t tc1 = now_ns(); g_t_cm_up += tc1 - tc0;
     unsigned ks = (g_slot_i - 1) % NSLOT;
     if (!signal && !g_slot[ks].vf) { VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; if (vk.vkCreateFence(V.dev, &fi, NULL, &g_slot[ks].vf)) g_slot[ks].vf = VK_NULL_HANDLE; }
+    if (!r) vka_mem_sync_gpu_reads();
     if (!r) r = vka_submit_fence(g_cb, signal, !signal ? g_slot[ks].vf : VK_NULL_HANDLE, gate_take());
     if (!r && !signal && g_slot[ks].vf) g_slot[ks].vf_on = 1;   // (no fence made: the slot waits for the timeline, as a signalled one)
     g_t_cm_sub += now_ns() - tc1;
@@ -773,7 +794,7 @@ void mtl_drain(void) { vka_pso_pause(1); vka_pso_save(1); mtl_present_flush(); m
 
 // ---------- Buffers ----------
 static void buf_copy(uint64_t src, uint64_t dst, uint64_t n) {
-    vka_tex_gw_copy(src, dst, n);
+    vka_tex_gw_copy(src, dst, n); post_inval(dst, n);
     while (n) {
         VkBuffer sb, db; VkDeviceSize so, dof;
         uint64_t a = vka_addr_run(src, n, &sb, &so), b = vka_addr_run(dst, n, &db, &dof), k = a < b ? a : b;
@@ -783,7 +804,7 @@ static void buf_copy(uint64_t src, uint64_t dst, uint64_t n) {
     }
 }
 static void buf_fill(uint64_t dst, uint64_t n, uint32_t value) {
-    vka_tex_gw_fill(dst, n, value);
+    vka_tex_gw_fill(dst, n, value); post_inval(dst, n);
     if ((dst | n) & 3) { VRED_ONCE("buffer fill at %#llx of %llu bytes is not 4-byte aligned", (unsigned long long)dst, (unsigned long long)n); return; }
     while (n) {
         VkBuffer b; VkDeviceSize o; uint64_t k = vka_addr_run(dst, n, &b, &o);
@@ -792,7 +813,7 @@ static void buf_fill(uint64_t dst, uint64_t n, uint32_t value) {
     }
 }
 static void buf_update(const void *data, uint64_t dst, uint64_t n) {   // inline data, in GPU order: through scratch memory
-    vka_tex_gw_update(dst, n, data);
+    vka_tex_gw_update(dst, n, data); post_inval(dst, n);
     vka_span s; if (!n || !vka_scratch(n, 16, &s)) return;
     memcpy(s.ptr, data, n);
     for (uint64_t done = 0; done < n;) {
@@ -1071,7 +1092,7 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
             {asp, lv, is3d ? 0 : l0 + (uint32_t)c->r.zoffset + (uint32_t)z, 1}, {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset : 0}, {(uint32_t)c->r.width, (uint32_t)c->r.height, is3d ? (uint32_t)nz : 1}};
     if (to_tex) { vk.vkCmdCopyBufferToImage(g_cb, bounce ? s.buf : b, im->img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)n, rg); vka_img_written(im); }
     else {
-        vka_tex_gw_opaque(c->src, span);
+        vka_tex_gw_opaque(c->src, span); post_inval(c->src, span);
         vk.vkCmdCopyImageToBuffer(g_cb, im->img, VK_IMAGE_LAYOUT_GENERAL, bounce ? s.buf : b, (uint32_t)n, rg);
         if (bounce) {
             vka_barrier(g_cb);
