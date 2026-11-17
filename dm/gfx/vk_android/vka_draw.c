@@ -1819,9 +1819,20 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
 // PEANUTS begin: resolution scale: the stages of this draw or dispatch whose shader fetches by pixel (vka_shader.rs_fetch): their plain 2D textures (not arrays, not
 // multisampled) are all scaled images or none is, for rs_support's one factor. A mix scales the scaled ones down for good (RS_WHY_FETCH_MIX), outside any pass.
 // After make_images (every image exists), from the walk
+static void rs_raw_fix(const vka_shader *s, int st) {
+    const vka_res *r = g_wk.r[st]; int n = g_wk.n[st], any = 0;
+    for (int i = 0; i < n; i++) {
+        if (r[i].what != VKA_R_TEX || !r[i].tid || r[i].desc == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) continue;
+        vka_img *im = vka_tex_id_img(r[i].tid, g_cb); if (!im || !im->rsc) continue;
+        if (!any) { any = 1; vka_rp_end(); }
+        vka_rs_st.ctx_key = s->key; if (!vka_tex_rs_down(im, g_cb, RS_WHY_FETCH_RAW)) vka_rs_st.skip++; vka_rs_st.ctx_key = 0;
+    }
+}
 static void rs_fetch_fix(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d) {
     for (int st = 0; st < VKA_NSTAGE; st++) {
-        const vka_shader *s = sh[st]; if (!s || !s->rs_fetch || (st == 1 && d->rast_discard)) continue;
+        const vka_shader *s = sh[st]; if (!s || (st == 1 && d->rast_discard)) continue;
+        if (s->rs_raw && VKA_ENV("DM_VK_RS_RAW", 1)) rs_raw_fix(s, st);
+        if (!s->rs_fetch) continue;
         const vka_res *r = g_wk.r[st]; int n = g_wk.n[st], ns = 0, nu = 0, same = 1, mixed = 0; uint32_t w = 0, h = 0;
         for (int pass = 0; pass < 2; pass++) {
             ns = nu = 0; same = 1; w = h = 0;

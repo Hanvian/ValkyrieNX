@@ -33,8 +33,8 @@ pthread_mutex_t vka_rs_mu = PTHREAD_MUTEX_INITIALIZER;
 static vkrs_deny g_rs_deny;   // (under g_tmu)
 static const char *const g_rs_why[RS_WHY_N] = {"its pass has a target that cannot be scaled", "a buffer is copied into it", "it is copied into a buffer", "a shader writes it as an image",
                                                "a copy with an unscaled image that a blit cannot convert", "a multisample resolve into it", "a shader fetches from it by pixel beside unscaled textures",
-                                               "an upscaler stand-in reads or writes it", "its storage is uploaded into it"};
-static const char *const g_rs_short[RS_WHY_N] = {"pass mix", "B2T", "T2B", "storage", "copy kind", "resolve", "fetch mix", "stand-in", "upload"};
+                                               "an upscaler stand-in reads or writes it", "its storage is uploaded into it", "a shader fetches from it by pixel through no scale helper"};
+static const char *const g_rs_short[RS_WHY_N] = {"pass mix", "B2T", "T2B", "storage", "copy kind", "resolve", "fetch mix", "stand-in", "upload", "fetch raw"};
 
 static int rs_blit_ok(VkFormat f) { VkFormatFeatureFlags ff = feats(f); return (ff & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (ff & VK_FORMAT_FEATURE_BLIT_DST_BIT); }
 // The device's start (vka_dev.c vka_init_once, once V.pd is there): the factor, and which depth formats can be blitted, said in every run so the first log of a device
@@ -76,7 +76,7 @@ static int rs_can_locked(vka_img *im) {
 static void rs_event(const vka_img *im, int up, int why, uint32_t ow, uint32_t oh, const char *content) {
     uint64_t *n = up ? &vka_rs_st.up : &vka_rs_st.down[why];
     if ((*n)++ >= 16) return;
-    char key[40] = ""; if (!up && why == RS_WHY_FETCH_MIX && vka_rs_st.ctx_key) snprintf(key, sizeof key, ", shader %016llx", (unsigned long long)vka_rs_st.ctx_key);
+    char key[40] = ""; if (!up && (why == RS_WHY_FETCH_MIX || why == RS_WHY_FETCH_RAW) && vka_rs_st.ctx_key) snprintf(key, sizeof key, ", shader %016llx", (unsigned long long)vka_rs_st.ctx_key);
     if (up) VLOG("res scale: up: texture serial %llu %ux%u NVN format %#x (VkFormat %d) flags %#x: image %ux%u -> %ux%u, %.1f MiB, %s (frame %llu)", (unsigned long long)im->serial, im->d.width, im->d.height,
                  im->d.format, im->f.vk, im->d.flags, ow, oh, im->w, im->h, im->bytes / 1048576.0, content, (unsigned long long)vka_frame());
     else VLOG("res scale: down (%s): texture serial %llu %ux%u NVN format %#x (VkFormat %d) flags %#x: %s%s; image %ux%u -> %ux%u, %s; its shape stays at 1x from now on (frame %llu)", g_rs_short[why],

@@ -323,7 +323,7 @@ typedef struct vka_img {
 extern uint32_t vka_rs_q;   // the factor in quarters (VKRS_ONE = 1x: off), set once by vka_rs_init before anything is replayed
 static inline int vka_rs_on(void) { return vka_rs_q != VKRS_ONE; }
 // Why a scaled image went back to 1x (counted; the first 16 of each logged)
-enum { RS_WHY_PASS_MIX, RS_WHY_B2T, RS_WHY_T2B, RS_WHY_STORAGE, RS_WHY_COPY_KIND, RS_WHY_RESOLVE, RS_WHY_FETCH_MIX, RS_WHY_STANDIN, RS_WHY_UPLOAD, RS_WHY_N };
+enum { RS_WHY_PASS_MIX, RS_WHY_B2T, RS_WHY_T2B, RS_WHY_STORAGE, RS_WHY_COPY_KIND, RS_WHY_RESOLVE, RS_WHY_FETCH_MIX, RS_WHY_STANDIN, RS_WHY_UPLOAD, RS_WHY_FETCH_RAW, RS_WHY_N };
 // The counts of the `res scale:` statistics line (written by the recording thread, or under the texture cache's lock; read for the line without either)
 typedef struct {
     uint64_t up, up_no_mem, busy, down[RS_WHY_N];   // images scaled; not scaled for their size; a change put off because a holder read the image; scaled down, by reason
@@ -480,6 +480,7 @@ typedef struct vka_shader {
     struct vka_memu_sh *memu_d;         // a task / mesh shader drawn through compute: its layout and compute / vertex forms (vka_memu.c), made at its first draw
     uint8_t memu;                       // such a form itself: 1 a task / mesh shader as compute (the arena, records and push constant in its layout), 2 a generated vertex shader (the arena)
     uint64_t chash;                     // its library entry's hash (vka_shlib_entry_hash), for the pipeline cache's stamp (vka_pso.c); 0 = not in the library
+    uint8_t rs_raw;
     uint8_t rs_fetch;                   // PEANUTS: it reads the support buffer's render_scale[1 + i] (a fetch by pixel or a size query of a 2D texture: vka_resscale.h vkrs_spv_scan), read only while DM_RES_SCALE is on
 } vka_shader;
 // An instanced variant's key (vka_draw.c's instanced runs): its base shader's key XOR this. It is no key of the shader library, and the variant depends on the uniform

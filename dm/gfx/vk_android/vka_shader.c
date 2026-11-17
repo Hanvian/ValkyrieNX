@@ -690,6 +690,7 @@ static void rs_scan(vka_shader *s, const vka_shlib *L, const dmsh_vk_entry *e, c
     unsigned fl = vkrs_spv_scan(w, nb / 4, bind);
     free(w);
     s->rs_fetch = (fl & VKRS_SPV_TEX) != 0;
+    s->rs_raw = (fl & VKRS_SPV_PIXEL) && !(fl & VKRS_SPV_TEX);
     atomic_fetch_add(&vka_rs_sh[0], 1);
     if (fl & VKRS_SPV_TEX) atomic_fetch_add(&vka_rs_sh[1], 1);
     if ((fl & VKRS_SPV_PIXEL) && !(fl & VKRS_SPV_TEX) && atomic_fetch_add(&vka_rs_sh[2], 1) < 16)
