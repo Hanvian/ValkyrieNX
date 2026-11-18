@@ -411,11 +411,39 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private String shapeNote;   // Aspect ratio › Screen shape: the window it read and the shape passed, for the log
     private int readinessEnv;   // the lines the readiness check ran with (readinessHold), for the log
 
+    static File findEnvFile(File files, File game, String id) {
+        if (game != null) {
+            File inGame = new File(game.isDirectory() ? game : game.getParentFile(), "env.txt");
+            if (inGame.isFile()) return inGame;
+        }
+        if (id != null) {
+            File inSwitch = new File("/storage/emulated/0/Switch Game/" + id + "/env.txt");
+            if (inSwitch.isFile()) return inSwitch;
+        }
+        File inFiles = new File(files, "env.txt");
+        if (inFiles.isFile()) return inFiles;
+        File inDoc = new File("/storage/emulated/0/Documents/env.txt");
+        if (inDoc.isFile()) return inDoc;
+        return inFiles;
+    }
+
+    static File findEnvIdFile(File files, File game, String id) {
+        if (game != null && id != null) {
+            File inGame = new File(game.isDirectory() ? game : game.getParentFile(), "env-" + id + ".txt");
+            if (inGame.isFile()) return inGame;
+        }
+        if (id != null) {
+            File inSwitch = new File("/storage/emulated/0/Switch Game/" + id + "/env-" + id + ".txt");
+            if (inSwitch.isFile()) return inSwitch;
+        }
+        return new File(files, "env-" + id + ".txt");
+    }
+
     /** Where a user line with this key came from, for the [RED] line: the last of env.txt, the game's settings, env-<id>.txt that has it */
-    private String switchFrom(String key, File files, String id) {
+    private String switchFrom(String key, File files, File game, String id) {
         String from = "env.txt";
         if (has(envLines(Prefs.gameEnv(this, id)), key)) from = "the game's settings";
-        if (has(quietEnv(new File(files, "env-" + id + ".txt")), key)) from = "env-" + id + ".txt";
+        if (has(quietEnv(findEnvIdFile(files, game, id)), key)) from = "env-" + id + ".txt";
         return from;
     }
     private static boolean has(List<String> lines, String key) { for (String kv : lines) if (kv.substring(0, kv.indexOf('=')).trim().equals(key)) return true; return false; }
@@ -498,14 +526,18 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private boolean readinessHold(String id) {
         if (readinessDone) return false;
         File files = getExternalFilesDir(null);
+        String gamePath = getIntent().getStringExtra("game");
+        File game = gamePath != null ? new File(gamePath) : null;
+        File envFile = findEnvFile(files, game, id);
+        File envIdFile = findEnvIdFile(files, game, id);
         Prefs.pinDriver(this, id);   // a recommended driver stays the one this check probes for the whole start (Prefs.pinDriver)
         // the game's environment as start() will set it (the launcher's settings, then the user's lines, which win), less the paths start() sets: the check makes the
         // process's first Vulkan device, and a driver reads some variables only then (FD_DEV_FEATURES, TU_DEBUG: GitHub #40)
         List<String> genv = new ArrayList<>();
         settingsEnv(id, genv);
-        genv.addAll(quietEnv(new File(files, "env.txt")));
+        genv.addAll(quietEnv(envFile));
         genv.addAll(envLines(Prefs.gameEnv(this, id)));
-        genv.addAll(quietEnv(new File(files, "env-" + id + ".txt")));
+        genv.addAll(quietEnv(envIdFile));
         String[] denv = Readiness.gameEnv(genv, PROTECTED);
         readinessEnv = denv.length;
         probedChoice = probedChoice(denv, id);
@@ -654,11 +686,13 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             // it stays open for this process's life, and the host duplicates it for each image it opens (nup_image.h)
             int nupFd = PickedNup.is(this, game.getPath()) ? PickedNup.detachedFd(this, game) : -1;
             if (nupFd >= 0) romfs = PickedPath.forHost(romfs, game, nupFd);
+            File envFile = findEnvFile(files, game, id);
+            File envIdFile = findEnvIdFile(files, game, id);
             // The user's lines, read first: the paths the launcher sets cannot be changed by them (guard), but the test app's env-<id>.txt may name a test save folder (one game's file only: a global DM_SAVE would point every game at one save)
-            List<String> user = new ArrayList<>(guard(userEnv(new File(files, "env.txt")), "env.txt", false));   // diagnostic switches (every game: never DM_SAVE) (DM_SVC=1, DM_FS=1, ...), as the iPhone's Documents/env.txt
+            List<String> user = new ArrayList<>(guard(userEnv(envFile), "env.txt", false));   // diagnostic switches (every game: never DM_SAVE) (DM_SVC=1, DM_FS=1, ...), as the iPhone's Documents/env.txt
             user.addAll(guard(LinkPlay.env(this, id), "Link Play", false));   // Game settings › Link Play (before the typed lines, which win)
             user.addAll(guard(envLines(Prefs.gameEnv(this, id)), "the game's settings", false));   // the game's own lines (its Game settings): after env.txt, so they win for this game
-            user.addAll(guard(userEnv(new File(files, "env-" + id + ".txt")), "env-" + id + ".txt", testApp()));   // and env-<title ID>.txt (adb), the same for one game
+            user.addAll(guard(userEnv(envIdFile), "env-" + id + ".txt", testApp()));   // and env-<title ID>.txt (adb), the same for one game
             File save = saveDir(files, game, id), temp = mkdirs(new File(files, "temp/" + id)), root = mkdirs(new File(files, "root"));
             // The DLC links live in internal app storage: the external files folder is shared storage (FUSE), which refuses symbolic links (errno not yet confirmed on a phone; a refused link is now a [RED] line), so
             // every link failed there and no game saw its DLC (docs/reference/packing.md "DLC links in shared storage"). Their targets stay where they are
@@ -722,7 +756,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             // DM_TEST_CRASH (a test crash, ExitWatch): the test app only
             if (!testApp() && user.removeIf(kv -> kv.startsWith("DM_TEST_CRASH="))) unknownNotes.add("[nxlaunch] DM_TEST_CRASH not taken: the test app only");
             env.addAll(user);
-            for (String k : Readiness.unknownSwitches(user, KNOWN_SWITCHES)) unknownNotes.add(Readiness.unknownLine(k, switchFrom(k, files, id), KNOWN_SWITCHES));
+            for (String k : Readiness.unknownSwitches(user, KNOWN_SWITCHES)) unknownNotes.add(Readiness.unknownLine(k, switchFrom(k, files, game, id), KNOWN_SWITCHES));
             boolean stretch = false;
             String testCrash = null;
             int picSize = PictureFit.SIZE_MAX;
@@ -761,6 +795,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             Native.note("nxnative " + BuildConfig.VERSION_NAME + " (" + BuildConfig.NX_COMMIT + "), host " + (BuildConfig.NX_GENERIC_HOST ? "libnxhost.so" : "libnxhost_" + id + ".so") + "; " + name + " " + id + " version " + pack.version);
             Native.note("device " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (SDK " + Build.VERSION.SDK_INT + "), " + Build.SUPPORTED_ABIS[0]
                     + "; game " + game + "; pack " + packDir);
+            if (envFile.isFile()) Native.note("[nxlaunch] env.txt: loaded from " + envFile.getPath());
             if (envProblem != null) Native.note("[RED] env.txt: " + envProblem);
             if (aocLine != null) Native.note(aocLine);
             for (String n : aocProblems) Native.note(n);
